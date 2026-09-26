@@ -35,7 +35,7 @@ async function body(request) {
 async function sessionUser(env, request, scope) {
   const value = credential(request, scope);
   if (!value) fail(401, '请先登录');
-  const user = await env.DB.prepare('SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)').bind(digest(value), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
+  const user = await env.DB.prepare('SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)').bind(digest(value), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
   if (!user) fail(401, '请先登录');
   return user;
 }
@@ -131,6 +131,19 @@ export default {
       const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft|google)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
       if (path === '/auth/v1/sessions' && request.method === 'POST') fail(404, '接口不存在');
+      if (path === '/auth/v1/identities' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const rows = await env.DB.prepare('SELECT provider,email,created_at FROM oauth_identities WHERE user_id=? ORDER BY created_at').bind(user.id).all();
+        return json(env, { identities: rows.results });
+      }
+      const identityMatch = path.match(/^\/auth\/v1\/identities\/(github|microsoft|google)$/);
+      if (identityMatch && request.method === 'DELETE') {
+        const user = await sessionUser(env, request, 'console');
+        const count = await env.DB.prepare('SELECT count(*) AS n FROM oauth_identities WHERE user_id=?').bind(user.id).first();
+        if ((count?.n ?? 0) <= 1) fail(400, '至少保留一个登录方式');
+        await env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=? AND provider=?').bind(user.id, identityMatch[1]).run();
+        return json(env, { ok: true });
+      }
       if (path === '/auth/v1/tokens' && request.method === 'POST') {
         const scope = scopeOf(url.searchParams.get('scope') || 'console');
         const user = await sessionUser(env, request, scope);
