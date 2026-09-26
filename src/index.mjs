@@ -9,8 +9,8 @@ const cookieValue = (request, name) => (request.headers.get('cookie') || '').spl
 const scopeOf = scope => ['console', 'operations'].includes(scope) ? scope : fail(400, '无效会话范围');
 const json = (data, status = 200, headers = {}) => Response.json(data, { status, headers: { 'cache-control': 'no-store', ...headers } });
 const oauthProviders = {
-  github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', callback: 'https://auth.pcln.top/auth/v1/oauth/github/callback' },
-  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', callback: 'https://auth.pcln.top/auth/v1/oauth/microsoft/callback' }
+  github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', callback: 'https://pcln.top/auth/v1/oauth/github/callback' },
+  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', callback: 'https://pcln.top/auth/v1/oauth/microsoft/callback' }
 };
 const configFor = (provider, env) => {
   const prefix = provider === 'github' ? 'GITHUB' : 'MICROSOFT';
