@@ -12,12 +12,13 @@ const cors = env => ({ 'access-control-allow-origin': env.WEB_ORIGIN, 'access-co
 const json = (env, data, status = 200, headers = {}) => Response.json(data, { status, headers: { 'cache-control': 'no-store', ...cors(env), ...headers } });
 const oauthStateCookie = 'nexa_oauth_state';
 const oauthProviders = {
-  github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', callback: 'https://auth.pcln.top/auth/v1/oauth/github/callback' },
-  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', callback: 'https://auth.pcln.top/auth/v1/oauth/microsoft/callback' }
+  github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', profile: 'https://api.github.com/user', callback: 'https://auth.pcln.top/auth/v1/oauth/github/callback', scope: 'read:user user:email' },
+  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', profile: 'https://graph.microsoft.com/oidc/userinfo', callback: 'https://auth.pcln.top/auth/v1/oauth/microsoft/callback', scope: 'openid profile email User.Read' },
+  google: { authorize: 'https://accounts.google.com/o/oauth2/v2/auth', token: 'https://oauth2.googleapis.com/token', profile: 'https://openidconnect.googleapis.com/v1/userinfo', callback: 'https://auth.pcln.top/auth/v1/oauth/google/callback', scope: 'openid profile email' }
 };
+const providerPrefix = { github: 'GITHUB', microsoft: 'MICROSOFT', google: 'GOOGLE' };
 const configFor = (provider, env) => {
-  const prefix = provider === 'github' ? 'GITHUB' : 'MICROSOFT';
-  const config = { ...oauthProviders[provider], clientId: env[`${prefix}_CLIENT_ID`], clientSecret: env[`${prefix}_CLIENT_SECRET`] };
+  const config = { ...oauthProviders[provider], clientId: env[`${providerPrefix[provider]}_CLIENT_ID`], clientSecret: env[`${providerPrefix[provider]}_CLIENT_SECRET`] };
   if (!config.clientId || !config.clientSecret) fail(503, '该登录方式尚未配置');
   return config;
 };
@@ -65,7 +66,7 @@ async function oauthStart(request, env, provider) {
   ]);
   const authorize = new URL(config.authorize);
   authorize.searchParams.set('client_id', config.clientId); authorize.searchParams.set('redirect_uri', config.callback); authorize.searchParams.set('response_type', 'code'); authorize.searchParams.set('state', state);
-  authorize.searchParams.set('scope', provider === 'github' ? 'read:user user:email' : 'openid profile email User.Read'); authorize.searchParams.set('nonce', nonce);
+  authorize.searchParams.set('scope', config.scope); authorize.searchParams.set('nonce', nonce);
   return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `${oauthStateCookie}=${state}; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=600${env.LOCAL_DEV === 'true' ? '' : '; Secure'}`, 'cache-control': 'no-store' } });
 }
 async function oauthCallback(request, env, provider, secure) {
@@ -85,7 +86,7 @@ async function oauthCallback(request, env, provider, secure) {
       const payload = b64json(tokenData.id_token.split('.')[1]);
       if (payload.nonce !== stateRow.nonce) throw new Error('nonce mismatch');
     }
-    const profileResponse = await fetch(provider === 'github' ? 'https://api.github.com/user' : 'https://graph.microsoft.com/oidc/userinfo', { headers: { authorization: `Bearer ${tokenData.access_token}`, accept: 'application/json', 'user-agent': 'nexa-auth' } });
+    const profileResponse = await fetch(config.profile, { headers: { authorization: `Bearer ${tokenData.access_token}`, accept: 'application/json', 'user-agent': 'nexa-auth' } });
     if (!profileResponse.ok) throw new Error('profile lookup failed');
     const profile = await profileResponse.json();
     const subject = String(provider === 'github' ? profile.id : (profile.sub || profile.id));
@@ -127,7 +128,7 @@ export default {
       if (!env.WEB_ORIGIN || (secure && !env.WEB_ORIGIN.startsWith('https://'))) fail(503, '身份服务尚未配置');
       if (request.method === 'OPTIONS' && path.startsWith('/auth/v1/')) return new Response(null, { status: 204, headers: { ...cors(env), 'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS', 'access-control-allow-headers': 'content-type, x-nexa-request, authorization', 'access-control-max-age': '600' } });
       if (!['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
-      const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft)\/(start|callback)$/);
+      const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft|google)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
       if (path === '/auth/v1/sessions' && request.method === 'POST') fail(404, '接口不存在');
       if (path === '/auth/v1/tokens' && request.method === 'POST') {
