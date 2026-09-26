@@ -1,0 +1,14 @@
+{
+  "name": "nexa-auth",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --env local --port 5733",
+    "check": "wrangler deploy --dry-run",
+    "types": "wrangler types",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "4.139.0"
+  }
+}
