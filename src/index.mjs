@@ -3,14 +3,17 @@ import { digest } from './password.mjs';
 class Failure extends Error { constructor(status, detail) { super(detail); this.status = status; } }
 const fail = (status, detail) => { throw new Failure(status, detail); };
 const cookieName = scope => scope === 'operations' ? 'nexa_staff' : 'nexa_console';
-const token = (request, scope) => (request.headers.get('cookie') || '').split(';').map(s => s.trim()).find(s => s.startsWith(cookieName(scope) + '='))?.slice(cookieName(scope).length + 1) || '';
-const oauthStateCookie = 'nexa_oauth_state';
 const cookieValue = (request, name) => (request.headers.get('cookie') || '').split(';').map(s => s.trim()).find(s => s.startsWith(name + '='))?.slice(name.length + 1) || '';
+const token = (request, scope) => cookieValue(request, cookieName(scope));
+const bearer = request => (request.headers.get('authorization') || '').match(/^Bearer ([^\s]+)$/)?.[1] || '';
+const credential = (request, scope) => bearer(request) || token(request, scope);
 const scopeOf = scope => ['console', 'operations'].includes(scope) ? scope : fail(400, '无效会话范围');
-const json = (data, status = 200, headers = {}) => Response.json(data, { status, headers: { 'cache-control': 'no-store', ...headers } });
+const cors = env => ({ 'access-control-allow-origin': env.WEB_ORIGIN, 'access-control-allow-credentials': 'true' });
+const json = (env, data, status = 200, headers = {}) => Response.json(data, { status, headers: { 'cache-control': 'no-store', ...cors(env), ...headers } });
+const oauthStateCookie = 'nexa_oauth_state';
 const oauthProviders = {
-  github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', callback: 'https://pcln.top/auth/v1/oauth/github/callback' },
-  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', callback: 'https://pcln.top/auth/v1/oauth/microsoft/callback' }
+  github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', callback: 'https://auth.pcln.top/auth/v1/oauth/github/callback' },
+  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', callback: 'https://auth.pcln.top/auth/v1/oauth/microsoft/callback' }
 };
 const configFor = (provider, env) => {
   const prefix = provider === 'github' ? 'GITHUB' : 'MICROSOFT';
@@ -28,10 +31,20 @@ async function body(request) {
   const all = new Uint8Array(bytes); let offset = 0; for (const part of parts) { all.set(part, offset); offset += part.length; }
   try { return JSON.parse(new TextDecoder().decode(all)); } catch { fail(400, '无效 JSON'); }
 }
-async function createSession(env, user, now, secure) {
+async function sessionUser(env, request, scope) {
+  const value = credential(request, scope);
+  if (!value) fail(401, '请先登录');
+  const user = await env.DB.prepare('SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)').bind(digest(value), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
+  if (!user) fail(401, '请先登录');
+  return user;
+}
+async function createSession(env, user, scope, now, secure) {
   const value = randomBytes(32).toString('base64url');
-  await env.DB.prepare('INSERT INTO sessions(token_hash,user_id,scope,expires) VALUES(?,?,?,?)').bind(digest(value), user.id, 'console', now + 86400000).run();
-  return { value, cookie: `nexa_console=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=86400${secure ? '; Secure' : ''}` };
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM sessions WHERE expires<?').bind(now),
+    env.DB.prepare('INSERT INTO sessions(token_hash,user_id,scope,expires) VALUES(?,?,?,?)').bind(digest(value), user.id, scope, now + (scope === 'operations' ? 3600000 : 86400000))
+  ]);
+  return { value, cookie: `${cookieName(scope)}=${value}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${scope === 'operations' ? 3600 : 86400}${secure ? '; Secure' : ''}` };
 }
 async function oauthStart(request, env, provider) {
   const config = configFor(provider, env), url = new URL(request.url);
@@ -101,7 +114,7 @@ async function oauthCallback(request, env, provider, secure) {
     headers.append('set-cookie', `${oauthStateCookie}=; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=0${secure ? '; Secure' : ''}`);
     if (stateRow.user_id) return new Response(null, { status: 303, headers });
     await env.DB.prepare('UPDATE users SET display_name=?,email=? WHERE id=?').bind(displayName, email, user.id).run();
-    const session = await createSession(env, user, now, secure);
+    const session = await createSession(env, user, 'console', now, secure);
     headers.append('set-cookie', session.cookie);
     return new Response(null, { status: 303, headers });
   } catch (error) { console.error(JSON.stringify({ oauth: provider, error: error.name })); return oauthError(env, '第三方登录失败，请重试'); }
@@ -112,23 +125,36 @@ export default {
     try {
       const secure = env.LOCAL_DEV !== 'true';
       if (!env.WEB_ORIGIN || (secure && !env.WEB_ORIGIN.startsWith('https://'))) fail(503, '身份服务尚未配置');
+      if (request.method === 'OPTIONS' && path.startsWith('/auth/v1/')) return new Response(null, { status: 204, headers: { ...cors(env), 'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS', 'access-control-allow-headers': 'content-type, x-nexa-request, authorization', 'access-control-max-age': '600' } });
       if (!['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
       const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
       if (path === '/auth/v1/sessions' && request.method === 'POST') fail(404, '接口不存在');
+      if (path === '/auth/v1/tokens' && request.method === 'POST') {
+        const scope = scopeOf(url.searchParams.get('scope') || 'console');
+        const user = await sessionUser(env, request, scope);
+        const now = Date.now();
+        const limit = await env.DB.prepare('INSERT INTO rate_limits(key,count,expires) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN expires<=? THEN 1 ELSE count+1 END,expires=CASE WHEN expires<=? THEN excluded.expires ELSE expires END RETURNING count').bind('mint:' + user.id, now + 3600000, now, now).first();
+        if (limit.count > 60) fail(429, '凭证请求过于频繁');
+        const session = await createSession(env, user, scope, now, secure);
+        return json(env, { token: session.value, user: { ...user, scope } });
+      }
       if (path === '/auth/v1/sessions/current') {
         const scope = scopeOf(url.searchParams.get('scope'));
-        if (request.method === 'GET') {
-          const user = await env.DB.prepare('SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)').bind(digest(token(request, scope)), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
-          if (!user) fail(401, '请先登录'); return json({ ...user, scope });
+        if (request.method === 'GET') return json(env, { ...await sessionUser(env, request, scope), scope });
+        if (request.method === 'DELETE') {
+          const value = credential(request, scope);
+          if (!value) fail(401, '请先登录');
+          // 注销该用户当前范围的全部会话（含 auth 域 Cookie 会话），避免静默续签绕过登出。
+          await env.DB.prepare('DELETE FROM sessions WHERE scope=? AND user_id=(SELECT user_id FROM sessions WHERE token_hash=? AND scope=?)').bind(scope, digest(value), scope).run();
+          return new Response(null, { status: 204, headers: { 'cache-control': 'no-store', ...cors(env), 'set-cookie': `${cookieName(scope)}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure ? '; Secure' : ''}` } });
         }
-        if (request.method === 'DELETE') { await env.DB.prepare('DELETE FROM sessions WHERE token_hash=? AND scope=?').bind(digest(token(request, scope)), scope).run(); return new Response(null, { status: 204, headers: { 'cache-control': 'no-store', 'set-cookie': `${cookieName(scope)}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0${secure ? '; Secure' : ''}` } }); }
-        return json({ type: 'about:blank', title: 'Method Not Allowed', status: 405, detail: '方法不支持' }, 405, { Allow: 'GET, DELETE', 'content-type': 'application/problem+json' });
+        return json(env, { type: 'about:blank', title: 'Method Not Allowed', status: 405, detail: '方法不支持' }, 405, { Allow: 'GET, DELETE', 'content-type': 'application/problem+json' });
       }
       fail(404, '接口不存在');
     } catch (error) {
       if (!error.status) console.error(JSON.stringify({ requestId: id, error: error.name }));
-      return json({ type: 'about:blank', title: 'Request failed', status: error.status || 500, detail: error.status ? error.message : '身份服务暂时不可用', instance: path, requestId: id }, error.status || 500, { 'content-type': 'application/problem+json', 'x-request-id': id });
+      return json(env, { type: 'about:blank', title: 'Request failed', status: error.status || 500, detail: error.status ? error.message : '身份服务暂时不可用', instance: path, requestId: id }, error.status || 500, { 'content-type': 'application/problem+json', 'x-request-id': id });
     }
   }
 };
