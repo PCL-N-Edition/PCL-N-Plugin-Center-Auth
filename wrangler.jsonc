@@ -5,7 +5,7 @@
   "compatibility_date": "2026-09-26",
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": false,
-  "routes": [{ "pattern": "auth.pcln.top", "custom_domain": true }],
+  "routes": [{ "pattern": "auth.pcln.top/*", "zone_name": "pcln.top" }],
   "observability": { "enabled": true, "head_sampling_rate": 0.1 },
   "vars": { "WEB_ORIGIN": "https://pcln.top" },
   "d1_databases": [{ "binding": "DB", "database_name": "pcln-production", "database_id": "453ca043-67cf-425e-9548-ec125e8389eb", "migrations_dir": "migrations" }],
