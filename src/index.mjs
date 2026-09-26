@@ -19,7 +19,7 @@ const configFor = (provider, env) => {
   return config;
 };
 const b64json = value => JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)), c => c.charCodeAt(0))));
-const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/?oauth_error=${encodeURIComponent(detail)}`, 303);
+const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/account?oauth_error=${encodeURIComponent(detail)}`, 303);
 async function body(request) {
   if (!request.headers.get('content-type')?.startsWith('application/json')) fail(415, '需要 JSON 请求');
   const reader = request.body?.getReader(); if (!reader) fail(400, '缺少请求体');
