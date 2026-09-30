@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { digest, hashPassword, verifyPassword } from './password.mjs';
 import { createMailer } from './mailer.mjs';
 import { validateHandle, validateDisplayName, normalizeHandle, isReservedHandle, HANDLE_COOLDOWN_DAYS } from './handles.mjs';
@@ -6,6 +6,7 @@ import { randomSecret, otpauthUrl, verifyTotp, encryptSecret, decryptSecret } fr
 import { generateRecoveryCodes, hashRecoveryCode } from './recovery.mjs';
 import { verifyRegistration, verifyAssertion, webauthnUserId } from './webauthn.mjs';
 import { fetchMinecraftStatus } from './minecraft.mjs';
+import { XBOX_SCOPE, XBOX_AUTHORIZE, XBOX_TOKEN, exchangeMicrosoftToken } from './microsoft.mjs';
 import { loadLevel, loadProgression, selectLevelDisplay, recordActivity, readActivity, validateVerification } from './progression.mjs';
 import { listConnections, createConnectionAuthorization, completeConnectionAuthorization, unlinkConnection } from './connections.mjs';
 class Failure extends Error { constructor(status, detail) { super(detail); this.status = status; } }
@@ -21,7 +22,7 @@ const json = (env, data, status = 200, headers = {}) => Response.json(data, { st
 const oauthStateCookie = 'nexa_oauth_state';
 const oauthProviders = {
   github: { authorize: 'https://github.com/login/oauth/authorize', token: 'https://github.com/login/oauth/access_token', profile: 'https://api.github.com/user', callback: 'https://auth.pcln.top/auth/v1/oauth/github/callback', scope: 'read:user user:email' },
-  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', profile: 'https://graph.microsoft.com/oidc/userinfo', callback: 'https://auth.pcln.top/auth/v1/oauth/microsoft/callback', scope: 'openid profile email User.Read' },
+  microsoft: { authorize: 'https://login.microsoftonline.com/common/oauth2/v2.0/authorize', token: 'https://login.microsoftonline.com/common/oauth2/v2.0/token', profile: 'https://graph.microsoft.com/oidc/userinfo', callback: 'https://auth.pcln.top/auth/v1/oauth/microsoft/callback', scope: 'openid profile email' },
   google: { authorize: 'https://accounts.google.com/o/oauth2/v2/auth', token: 'https://oauth2.googleapis.com/token', profile: 'https://openidconnect.googleapis.com/v1/userinfo', callback: 'https://auth.pcln.top/auth/v1/oauth/google/callback', scope: 'openid profile email' }
 };
 const providerPrefix = { github: 'GITHUB', microsoft: 'MICROSOFT', google: 'GOOGLE' };
@@ -31,9 +32,12 @@ const configFor = (provider, env) => {
   return config;
 };
 const b64json = value => JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)), c => c.charCodeAt(0))));
-// Microsoft 绑定专用：用带 XboxLive.signin 的 MSA 令牌走 XBL → XSTS → Minecraft 服务，
-// 查询游戏拥有状况与档案（id/name）。只存结果，不存任何 Xbox/MC 令牌。
-const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/login?oauth_error=${encodeURIComponent(detail)}`, 303);
+const xboxConfig = env => ({ ...configFor('microsoft', env), authorize: XBOX_AUTHORIZE, token: XBOX_TOKEN, scope: XBOX_SCOPE });
+const oauthError = (env, detail, stateRow) => {
+  const target = new URL(stateRow?.user_id ? '/account?section=linked' : '/login', env.WEB_ORIGIN);
+  target.searchParams.set(stateRow?.purpose === 'minecraft' ? 'minecraft_error' : 'oauth_error', detail);
+  return new Response(null, { status: 303, headers: { location: target.href, 'cache-control': 'no-store' } });
+};
 const auditEvent = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) VALUES(?,?,?,?)').bind(actor, action, new Date().toISOString(), detail ?? null);
 // 仅在前一条语句（INSERT OR IGNORE）实际写入时记录，用于条款首次接受等幂等事件。
 const auditOnChange = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) SELECT ?,?,?,? WHERE changes()=1').bind(actor, action, new Date().toISOString(), detail ?? null);
@@ -128,64 +132,126 @@ async function oauthStart(request, env, provider) {
   const returnPath = url.searchParams.get('return_to') || '/';
   if (!returnPath.startsWith('/') || returnPath.startsWith('//')) fail(400, '无效返回地址');
   const mode = url.searchParams.get('mode') === 'link' ? 'link' : 'login';
-  let userId = null, termsPolicyId = null;
+  let userId = null, termsPolicyId = null, sessionHash = null, sessionScope = null;
   if (mode === 'link') {
     const scope = scopeOf(url.searchParams.get('scope') || 'console');
-    const current = await env.DB.prepare('SELECT user_id FROM sessions WHERE token_hash=? AND scope=? AND expires>?').bind(digest(token(request, scope)), scope, Date.now()).first();
-    if (!current) fail(401, '请先登录后再绑定身份');
-    userId = current.user_id;
+    const current = await sessionUser(env, request, scope);
+    userId = current.id; sessionHash = digest(credential(request, scope)); sessionScope = scope;
   } else {
     const terms = await currentPolicy(env, 'terms');
     if (url.searchParams.get('tos') !== terms.version) fail(400, '需要先接受当前版本的服务条款');
     termsPolicyId = terms.id;
   }
   const state = randomBytes(32).toString('base64url'), nonce = randomBytes(32).toString('base64url'), expires = Date.now() + 600000;
+  const verifier = provider === 'microsoft' ? randomBytes(32).toString('base64url') : null;
   await env.DB.batch([
     env.DB.prepare('DELETE FROM oauth_states WHERE expires<? OR consumed=1').bind(Date.now()),
-    env.DB.prepare('INSERT INTO oauth_states(state,nonce,provider,return_to,user_id,terms_policy_id,expires,created_at) VALUES(?,?,?,?,?,?,?,?)').bind(state, nonce, provider, returnPath, userId, termsPolicyId, expires, new Date().toISOString())
+    env.DB.prepare('INSERT INTO oauth_states(state,nonce,provider,return_to,user_id,terms_policy_id,expires,created_at,session_hash,session_scope,code_verifier) VALUES(?,?,?,?,?,?,?,?,?,?,?)').bind(state, nonce, provider, returnPath, userId, termsPolicyId, expires, new Date().toISOString(), sessionHash, sessionScope, verifier)
   ]);
   const authorize = new URL(config.authorize);
   authorize.searchParams.set('client_id', config.clientId); authorize.searchParams.set('redirect_uri', config.callback); authorize.searchParams.set('response_type', 'code'); authorize.searchParams.set('state', state);
-  // Microsoft 仅在“绑定”时额外请求 XboxLive.signin 与 offline_access：查询 Minecraft 拥有状况与档案，
-  // 并加密保存刷新令牌供启动器后续派生令牌；普通登录保持最小 scope（与 7307a22 的收窄一致）。
-  authorize.searchParams.set('scope', provider === 'microsoft' && mode === 'link' ? `${config.scope} XboxLive.signin offline_access` : config.scope);
+  // Website identity never asks for Xbox permissions, including when linking.
+  authorize.searchParams.set('scope', config.scope);
   authorize.searchParams.set('nonce', nonce);
+  if (verifier) {
+    authorize.searchParams.set('code_challenge', createHash('sha256').update(verifier).digest('base64url'));
+    authorize.searchParams.set('code_challenge_method', 'S256');
+  }
   return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `${oauthStateCookie}=${state}; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=600${env.LOCAL_DEV === 'true' ? '' : '; Secure'}`, 'cache-control': 'no-store' } });
 }
+async function startMinecraftAuthorization(request, env) {
+  const user = await sessionUser(env, request, 'console');
+  if (user.setupRequired || !user.termsAccepted) fail(403, '请先完成注册并接受服务条款');
+  if (!await env.DB.prepare("SELECT 1 FROM oauth_identities WHERE user_id=? AND provider='microsoft'").bind(user.id).first()) fail(409, '请先关联 Microsoft 账户');
+  if (!env.TOKEN_ENC_KEY) fail(503, '游戏授权保管尚未配置');
+  const config = xboxConfig(env);
+  await rateLimit(env, 'mc-authorize:' + user.id, 10, 3600000, '授权请求过于频繁');
+  const state = randomBytes(32).toString('base64url'), nonce = randomBytes(32).toString('base64url'), verifier = randomBytes(32).toString('base64url'), expires = Date.now() + 600000;
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM oauth_states WHERE user_id=? AND provider='microsoft' AND purpose='minecraft'").bind(user.id),
+    env.DB.prepare("INSERT INTO oauth_states(state,nonce,provider,return_to,user_id,expires,created_at,purpose,session_hash,session_scope,code_verifier) VALUES(?,?,'microsoft','/account?section=linked',?,?,?,'minecraft',?,'console',?)")
+      .bind(state, nonce, user.id, expires, new Date().toISOString(), digest(credential(request, 'console')), verifier)
+  ]);
+  const authorize = new URL(config.authorize);
+  for (const [name, value] of Object.entries({ client_id: config.clientId, redirect_uri: config.callback, response_type: 'code', state, scope: config.scope, prompt: 'select_account', code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256' })) authorize.searchParams.set(name, value);
+  return json(env, { url: authorize.href, expiresAt: new Date(expires).toISOString() }, 201, {
+    'set-cookie': `${oauthStateCookie}=${state}; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=600${env.LOCAL_DEV === 'true' ? '' : '; Secure'}`
+  });
+}
+async function liveOAuthSession(env, row) {
+  if (!row?.user_id || !row.session_hash || !row.session_scope) return false;
+  return Boolean(await env.DB.prepare(`SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.user_id=? AND s.scope=? AND s.expires>? AND u.disabled=0`).bind(row.session_hash, row.user_id, row.session_scope, Date.now()).first());
+}
+async function completeMinecraftAuthorization(env, row, config, code, secure) {
+  const tokens = await exchangeMicrosoftToken(config, { code, redirect_uri: config.callback, grant_type: 'authorization_code', scope: config.scope, code_verifier: row.code_verifier });
+  if (typeof tokens.refresh_token !== 'string' || !tokens.refresh_token || !env.TOKEN_ENC_KEY) throw new Error('游戏持续授权未完成，请重新授权');
+  const status = await fetchMinecraftStatus(tokens.access_token);
+  const now = Date.now(), encrypted = await encryptSecret(tokens.refresh_token, env.TOKEN_ENC_KEY);
+  const [saved] = await env.DB.batch([
+    env.DB.prepare(`INSERT INTO microsoft_tokens(user_id,refresh_token_enc,obtained_at,grant_version)
+      SELECT ?,?,?,1 WHERE EXISTS(SELECT 1 FROM oauth_states os JOIN sessions s ON s.token_hash=os.session_hash AND s.user_id=os.user_id AND s.scope=os.session_scope
+        JOIN users u ON u.id=os.user_id WHERE os.state=? AND os.purpose='minecraft' AND os.consumed=1 AND os.expires>? AND s.expires>? AND u.disabled=0
+        AND EXISTS(SELECT 1 FROM oauth_identities oi WHERE oi.user_id=os.user_id AND oi.provider='microsoft'))
+      ON CONFLICT(user_id) DO UPDATE SET refresh_token_enc=excluded.refresh_token_enc,obtained_at=excluded.obtained_at,grant_version=1`)
+      .bind(row.user_id, encrypted, new Date(now).toISOString(), row.state, now, now),
+    env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at)
+      SELECT ?,?,?,?,NULL,? WHERE changes()=1
+      ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned,profile_id=excluded.profile_id,profile_name=excluded.profile_name,error=NULL,checked_at=excluded.checked_at`)
+      .bind(row.user_id, status.owned, status.profileId, status.profileName, new Date(now).toISOString()),
+    auditOnChange(env, row.user_id, 'minecraft.authorized', `owned:${status.owned}`)
+  ]);
+  if (!saved.meta.changes) throw new Error('授权状态已失效，请重新开始');
+  const target = new URL('/account?section=linked&minecraft_success=1', env.WEB_ORIGIN);
+  return new Response(null, { status: 303, headers: { location: target.href, 'cache-control': 'no-store', 'set-cookie': `${oauthStateCookie}=; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=0${secure ? '; Secure' : ''}` } });
+}
 async function oauthCallback(request, env, provider, secure) {
-  const config = configFor(provider, env), url = new URL(request.url), state = url.searchParams.get('state'), code = url.searchParams.get('code');
-  if (!state || !code || url.searchParams.get('error')) return oauthError(env, '第三方登录未完成');
+  const url = new URL(request.url), state = url.searchParams.get('state'), code = url.searchParams.get('code');
+  if (!state) return oauthError(env, '第三方登录未完成');
   const now = Date.now();
   const stateRow = await env.DB.prepare('SELECT * FROM oauth_states WHERE state=? AND provider=? AND consumed=0 AND expires>?').bind(state, provider, now).first();
   if (!stateRow || cookieValue(request, oauthStateCookie) !== state) return oauthError(env, '登录状态已失效，请重试');
+  if (stateRow.user_id && !await liveOAuthSession(env, stateRow)) return oauthError(env, '关联会话已失效，请重新登录后重试', stateRow);
   const consumed = await env.DB.prepare('UPDATE oauth_states SET consumed=1 WHERE state=? AND provider=? AND consumed=0 AND expires>?').bind(state, provider, now).run();
-  if (!consumed.meta.changes) return oauthError(env, '登录状态已被使用，请重试');
+  if (!consumed.meta.changes) return oauthError(env, '登录状态已被使用，请重试', stateRow);
+  if (!code || url.searchParams.get('error')) return oauthError(env, '授权未完成或已取消，请重试', stateRow);
+  const config = stateRow.purpose === 'minecraft' ? xboxConfig(env) : configFor(provider, env);
   try {
-    const tokenResponse = await fetch(config.token, { method: 'POST', headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, code, redirect_uri: config.callback, grant_type: 'authorization_code' }) });
-    if (!tokenResponse.ok) throw new Error('token exchange failed');
-    const tokenData = await tokenResponse.json();
+    if (stateRow.purpose === 'minecraft') return await completeMinecraftAuthorization(env, stateRow, config, code, secure);
+    const parameters = { client_id: config.clientId, client_secret: config.clientSecret, code, redirect_uri: config.callback, grant_type: 'authorization_code', ...(provider === 'microsoft' ? { scope: config.scope, ...(stateRow.code_verifier ? { code_verifier: stateRow.code_verifier } : {}) } : {}) };
+    const tokenData = provider === 'microsoft' ? await exchangeMicrosoftToken(config, parameters) : await (async () => {
+      const response = await fetch(config.token, { method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(12000), headers: { accept: 'application/json', 'content-type': 'application/x-www-form-urlencoded' }, body: new URLSearchParams(parameters) });
+      if (!response.ok) throw new Error('第三方授权换取失败，请重试');
+      return response.json();
+    })();
     if (!tokenData.access_token) throw new Error('missing access token');
     if (provider === 'microsoft' && tokenData.id_token) {
       const payload = b64json(tokenData.id_token.split('.')[1]);
       if (payload.nonce !== stateRow.nonce) throw new Error('nonce mismatch');
     }
-    const profileResponse = await fetch(config.profile, { headers: { authorization: `Bearer ${tokenData.access_token}`, accept: 'application/json', 'user-agent': 'nexa-auth' } });
+    const profileResponse = await fetch(config.profile, { redirect: 'manual', signal: AbortSignal.timeout(12000), headers: { authorization: `Bearer ${tokenData.access_token}`, accept: 'application/json', 'user-agent': 'nexa-auth' } });
     if (!profileResponse.ok) throw new Error('profile lookup failed');
     const profile = await profileResponse.json();
-    const subject = String(provider === 'github' ? profile.id : (profile.sub || profile.id));
+    const rawSubject = provider === 'github' ? profile.id : (profile.sub || profile.id);
+    if (!['string', 'number'].includes(typeof rawSubject) || !String(rawSubject).trim()) throw new Error('第三方身份资料无效');
+    const subject = String(rawSubject);
     const email = typeof profile.email === 'string' ? profile.email.toLowerCase().slice(0, 320) : null;
     const displayName = String(profile.name || profile.login || profile.preferred_username || subject).slice(0, 160);
     let identity = await env.DB.prepare('SELECT user_id FROM oauth_identities WHERE provider=? AND subject=?').bind(provider, subject).first();
     let user;
     if (stateRow.user_id) {
+      if (!await liveOAuthSession(env, stateRow)) throw new Error('关联会话已失效，请重新开始');
       user = await env.DB.prepare('SELECT id,name,disabled FROM users WHERE id=?').bind(stateRow.user_id).first();
       if (!user || user.disabled) throw new Error('account disabled');
-      if (identity && identity.user_id !== user.id) throw new Error('该第三方账号已绑定其他账户');
+      if (identity && identity.user_id !== user.id) return oauthError(env, '该第三方账号已关联其他账户', stateRow);
       if (!identity) {
-        await env.DB.batch([
-          env.DB.prepare('INSERT INTO oauth_identities(provider,subject,user_id,email,created_at,updated_at) VALUES(?,?,?,?,?,?)').bind(provider, subject, user.id, email, new Date().toISOString(), new Date().toISOString()),
-          auditEvent(env, user.id, 'oauth.linked', `${provider}:${subject}`)
+        const [linked] = await env.DB.batch([
+          env.DB.prepare(`INSERT INTO oauth_identities(provider,subject,user_id,email,created_at,updated_at)
+            SELECT ?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM oauth_states os JOIN sessions s ON s.token_hash=os.session_hash AND s.user_id=os.user_id AND s.scope=os.session_scope
+              JOIN users u ON u.id=os.user_id WHERE os.state=? AND os.purpose='identity' AND os.consumed=1 AND os.expires>? AND s.expires>? AND u.disabled=0)`)
+            .bind(provider, subject, user.id, email, new Date().toISOString(), new Date().toISOString(), stateRow.state, Date.now(), Date.now()),
+          auditOnChange(env, user.id, 'oauth.linked', `${provider}:${subject}`)
         ]);
+        if (!linked.meta.changes) throw new Error('关联会话已失效，请重新开始');
       }
     } else if (identity) {
       user = await env.DB.prepare('SELECT id,name,disabled,confirmed_at FROM users WHERE id=?').bind(identity.user_id).first();
@@ -203,24 +269,6 @@ async function oauthCallback(request, env, provider, secure) {
     const headers = new Headers({ location: new URL(stateRow.return_to, env.WEB_ORIGIN).toString(), 'cache-control': 'no-store' });
     headers.append('set-cookie', `${oauthStateCookie}=; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=0${secure ? '; Secure' : ''}`);
     if (stateRow.user_id) {
-      // 绑定 Microsoft 成功：同步查询 Xbox → Minecraft 拥有状况与档案并落库。
-      // 任何一步失败都不阻塞绑定本身，只记录 error 供界面展示。
-      if (provider === 'microsoft') {
-        let status = null, chainError = null;
-        try { status = await fetchMinecraftStatus(tokenData.access_token); }
-        catch (chainFailure) { chainError = String(chainFailure?.message ?? chainFailure).slice(0, 60); }
-        const statements = [
-          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,?,?)
-            ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=excluded.error, checked_at=excluded.checked_at`)
-            .bind(user.id, status?.owned ?? null, status?.profileId ?? null, status?.profileName ?? null, chainError, new Date().toISOString()),
-          auditEvent(env, user.id, 'minecraft.checked', status ? `owned:${status.owned}` : chainError)
-        ];
-        // 刷新令牌仅在配置 TOKEN_ENC_KEY 时以 AES-GCM 加密保存；无密钥则拒绝落盘（绝不存明文）。
-        if (typeof tokenData.refresh_token === 'string' && env.TOKEN_ENC_KEY) {
-          statements.push(env.DB.prepare('INSERT INTO microsoft_tokens(user_id,refresh_token_enc,obtained_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET refresh_token_enc=excluded.refresh_token_enc, obtained_at=excluded.obtained_at').bind(user.id, await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY), new Date().toISOString()));
-        }
-        await env.DB.batch(statements);
-      }
       return new Response(null, { status: 303, headers });
     }
     await env.DB.prepare('UPDATE users SET display_name=?,email=? WHERE id=?').bind(displayName, email, user.id).run();
@@ -242,7 +290,10 @@ async function oauthCallback(request, env, provider, secure) {
     // 未完成注册的用户强制进入完善资料页;已确认用户按 return_to 回跳。
     if (!user.confirmed_at) headers.set('location', new URL('/register?setup=1', env.WEB_ORIGIN).toString());
     return new Response(null, { status: 303, headers });
-  } catch (error) { console.error(JSON.stringify({ oauth: provider, error: error.name })); return oauthError(env, '第三方登录失败，请重试'); }
+  } catch (error) {
+    console.error(JSON.stringify({ oauth: provider, purpose: stateRow.purpose, error: error.name }));
+    return oauthError(env, stateRow.purpose === 'minecraft' ? 'Minecraft 授权失败，请重试；确认所选账户已开通 Xbox 资料' : '第三方身份关联或登录失败，请重试', stateRow);
+  }
 }
 export async function finalizeAccountDeletion(env, requestId, userId) {
   const now = new Date().toISOString();
@@ -305,6 +356,21 @@ export default {
       if (!path.startsWith('/internal/') && !['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
       const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft|google)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
+      if (path === '/auth/v1/minecraft/authorizations') {
+        if (request.method !== 'POST') fail(405, '方法不支持');
+        return await startMinecraftAuthorization(request, env);
+      }
+      if (path === '/auth/v1/minecraft/authorization') {
+        if (request.method !== 'DELETE') fail(405, '方法不支持');
+        const user = await sessionUser(env, request, 'console');
+        await env.DB.batch([
+          env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(user.id),
+          env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id),
+          env.DB.prepare("DELETE FROM oauth_states WHERE user_id=? AND purpose='minecraft'").bind(user.id),
+          auditEvent(env, user.id, 'minecraft.revoked', null)
+        ]);
+        return new Response(null, { status: 204, headers: { 'cache-control': 'no-store', ...cors(env) } });
+      }
       const connectionPath = path.match(/^\/auth\/v1\/connections\/(bilibili|afdian)(?:\/(authorizations|callback))?$/);
       if (connectionPath?.[2] === 'callback' && request.method === 'GET') return await completeConnectionAuthorization(request, env, connectionPath[1]);
       if (path === '/auth/v1/connections' && request.method === 'GET') return json(env, await listConnections(env, (await sessionUser(env, request, 'console')).id));
@@ -510,31 +576,34 @@ export default {
       // 启动器取 Minecraft 令牌：用加密保存的刷新令牌重新派生 XSTS，实时下发短时令牌并刷新档案。
       if (path === '/auth/v1/minecraft/token' && request.method === 'POST') {
         const user = await sessionUser(env, request, 'console');
+        if (user.setupRequired || !user.termsAccepted) fail(403, '请先完成注册并接受服务条款');
         await rateLimit(env, 'mctoken:' + user.id, 10, 3600000, '令牌请求过于频繁，请稍后再试');
-        const row = await env.DB.prepare('SELECT refresh_token_enc FROM microsoft_tokens WHERE user_id=?').bind(user.id).first();
-        if (!row) fail(409, '未存储 Microsoft 刷新令牌：请在账户页重新绑定 Microsoft');
-        const config = configFor('microsoft', env);
-        const tokenRes = await fetch(config.token, {
-          method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
-          body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, refresh_token: await decryptSecret(row.refresh_token_enc, env.TOKEN_ENC_KEY), grant_type: 'refresh_token', scope: 'XboxLive.signin offline_access' })
-        });
-        const tokenData = await tokenRes.json().catch(() => ({}));
-        if (!tokenRes.ok || !tokenData.access_token) {
-          await auditEvent(env, user.id, 'minecraft.token.failed', `http:${tokenRes.status}`).run();
-          fail(502, 'Microsoft 令牌刷新失败，请重新绑定账户');
-        }
-        if (typeof tokenData.refresh_token === 'string' && env.TOKEN_ENC_KEY) {
-          await env.DB.prepare('UPDATE microsoft_tokens SET refresh_token_enc=?, obtained_at=? WHERE user_id=?').bind(await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY), new Date().toISOString(), user.id).run();
+        const row = await env.DB.prepare('SELECT refresh_token_enc,grant_version FROM microsoft_tokens WHERE user_id=?').bind(user.id).first();
+        if (!row || row.grant_version !== 1) fail(409, '请在账户页单独授权 Minecraft');
+        if (!env.TOKEN_ENC_KEY) fail(503, '游戏授权保管尚未配置');
+        const config = xboxConfig(env);
+        let tokenData;
+        try { tokenData = await exchangeMicrosoftToken(config, { refresh_token: await decryptSecret(row.refresh_token_enc, env.TOKEN_ENC_KEY), grant_type: 'refresh_token', scope: config.scope }); }
+        catch {
+          await auditEvent(env, user.id, 'minecraft.token.failed', 'refresh_failed').run();
+          fail(502, '游戏令牌刷新失败，请在账户页重新授权 Minecraft');
         }
         let status;
         try { status = await fetchMinecraftStatus(tokenData.access_token); }
         catch (chainFailure) { fail(502, 'Minecraft 服务暂不可用：' + String(chainFailure?.message ?? chainFailure).slice(0, 40)); }
-        await env.DB.batch([
-          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,NULL,?)
+        const refreshed = typeof tokenData.refresh_token === 'string' && tokenData.refresh_token ? await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY) : row.refresh_token_enc;
+        const now = Date.now();
+        const [saved] = await env.DB.batch([
+          env.DB.prepare(`UPDATE microsoft_tokens SET refresh_token_enc=?,obtained_at=? WHERE user_id=? AND grant_version=1 AND refresh_token_enc=?
+            AND EXISTS(SELECT 1 FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.user_id=microsoft_tokens.user_id AND s.scope='console' AND s.expires>? AND u.disabled=0)
+            AND EXISTS(SELECT 1 FROM oauth_identities oi WHERE oi.user_id=microsoft_tokens.user_id AND oi.provider='microsoft')`)
+            .bind(refreshed, new Date(now).toISOString(), user.id, row.refresh_token_enc, digest(credential(request, 'console')), now),
+          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) SELECT ?,?,?,?,NULL,? WHERE changes()=1
             ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=NULL, checked_at=excluded.checked_at`)
             .bind(user.id, status.owned, status.profileId, status.profileName, new Date().toISOString()),
-          auditEvent(env, user.id, 'minecraft.token.issued', `owned:${status.owned}`)
+          auditOnChange(env, user.id, 'minecraft.token.issued', `owned:${status.owned}`)
         ]);
+        if (!saved.meta.changes) fail(409, '游戏授权或会话已改变，请重试或重新授权');
         if (!status.owned) fail(403, '该 Microsoft 账户未拥有 Minecraft');
         return json(env, { accessToken: status.accessToken, profileId: status.profileId, profileName: status.profileName, owned: true });
       }
@@ -854,15 +923,17 @@ export default {
         const rows = await env.DB.prepare('SELECT provider,email,created_at FROM oauth_identities WHERE user_id=? ORDER BY created_at').bind(user.id).all();
         return json(env, { identities: rows.results });
       }
-      // Minecraft 拥有状况与档案：启动器与账户页共用（绑定 Microsoft 时写入）。
+      // Minecraft 档案由独立 Xbox 授权写入，不从网站身份令牌派生。
       if (path === '/auth/v1/account/minecraft' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const [identity, profile] = await Promise.all([
+        const [identity, profile, grant] = await Promise.all([
           env.DB.prepare("SELECT 1 AS linked FROM oauth_identities WHERE user_id=? AND provider='microsoft'").bind(user.id).first(),
-          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first()
+          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first(),
+          env.DB.prepare('SELECT grant_version FROM microsoft_tokens WHERE user_id=?').bind(user.id).first()
         ]);
         return json(env, {
           microsoftLinked: Boolean(identity),
+          xboxAuthorized: grant?.grant_version === 1,
           owned: profile?.owned ?? null,
           profileId: profile?.profile_id ?? null,
           profileName: profile?.profile_name ?? null,
@@ -877,7 +948,7 @@ export default {
         if ((count?.n ?? 0) <= 1) fail(400, '至少保留一个登录方式');
         await env.DB.batch([
           env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=? AND provider=?').bind(user.id, identityMatch[1]),
-          ...(identityMatch[1] === 'microsoft' ? [env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id), env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(user.id)] : []),
+          ...(identityMatch[1] === 'microsoft' ? [env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id), env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(user.id), env.DB.prepare("DELETE FROM oauth_states WHERE user_id=? AND provider='microsoft' AND purpose='minecraft'").bind(user.id)] : []),
           auditEvent(env, user.id, 'oauth.unlinked', identityMatch[1])
         ]);
         return json(env, { ok: true });

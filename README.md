@@ -52,13 +52,17 @@ Web 在 auth 域使用 HttpOnly Cookie 会话，换取仅存内存的 API Bearer
 本地开发 `pnpm dev`（端口 5733，与 Web 仓库 vite 代理一致）；单元测试 `pnpm test`（零依赖，
 覆盖 RFC 6238 向量、CBOR 往返、真实 P-256 密钥的 WebAuthn 注册/断言全流程）。
 
-## Microsoft 绑定 → Xbox → Minecraft 档案（migration 0008）
+## Microsoft 身份与 Xbox / Minecraft 独立授权（migration 0016）
 
-- Microsoft **绑定（link）模式**额外请求 `XboxLive.signin`；普通登录保持最小 scope。
-- 绑定成功后服务端执行 XBL → XSTS → `entitlements/mcstore` → `minecraft/profile` 链路，
-  将拥有状况与档案（UUID/名称）写入 `minecraft_profiles`；不存储任何 Xbox/MC 令牌。
-  链路失败不阻塞绑定，错误码记入 `error` 字段并写审计（`minecraft.checked`）。
-- `GET /auth/v1/account/minecraft` — 账户页与启动器共用读取端点；解绑 Microsoft 时级联清除。
+- Microsoft 网站登录及身份关联均只请求 `openid profile email`，使用 Graph UserInfo；不会请求游戏权限，也不会把资料令牌发给 Xbox。
+- `POST /auth/v1/minecraft/authorizations` — 关联 Microsoft 后另行授权游戏能力；返回 201 `{url,expiresAt}`。使用 `/consumers/` 端点和 `XboxLive.signin XboxLive.offline_access`，不混入 OIDC / Graph scope。复用已登记的 Microsoft callback，无需增加回调地址。
+- 游戏账户独立授权给当前 Nexa 账户，可以与网站 Microsoft 登录身份不同。`prompt=select_account` 供用户选择；游戏授权不能替代网站登录身份。
+- OAuth state 有 10 分钟有效期、单次消费和 S256 PKCE，绑定原 Nexa 会话；回调前及最终 D1 写入重新检查会话、账户及身份。重新发起、退出、撤销或移除 Microsoft 登录身份会使旧游戏授权失效。
+- 游戏授权后服务端执行 MSA → Xbox User Token → XSTS → Minecraft 令牌 → 权益与档案读取；各阶段只使用对应资源的令牌，不将 Xbox 令牌用于 Graph。不保存短时访问令牌。
+- `GET /auth/v1/account/minecraft` 读取拥有状况、档案及 `xboxAuthorized`；`DELETE /auth/v1/minecraft/authorization` 单独清除游戏令牌、档案和待完成授权，返回 204，保留网站登录身份。移除 Microsoft 身份及注销也会清除游戏授权。
+- 关联或游戏授权失败回到账户页显示安全提示；普通登录失败仍返回登录页，不把上游错误正文、令牌或应用密钥带入 URL。
+
+接口与资源范围依据 [Microsoft Xbox 网站授权说明](https://learn.microsoft.com/en-us/gaming/gdk/docs/services/fundamentals/s2s-auth-calls/service-authentication/live-website-authentication)。真实第三方授权仍需用户交互，测试使用实际 Worker/D1 与隔离的上游响应，不能替代真实 Microsoft / Minecraft 应用权限验证。
 
 ## 注册与 Microsoft 令牌保管（migration 0009）
 
@@ -69,10 +73,10 @@ Web 在 auth 域使用 HttpOnly Cookie 会话，换取仅存内存的 API Bearer
   仅未激活账户可用：设置用户名与用户 ID（唯一性校验、回收他人废弃同名注册）；
   **设置密码时必须同时完成验证器绑定**（密码 ⇔ 2FA 不变量），成功后账户激活。
   不提供纯密码直连注册。
-- Microsoft 绑定追加 `offline_access`：刷新令牌以 AES-GCM（`TOKEN_ENC_KEY`）加密存入
-  `microsoft_tokens`；未配置密钥则拒绝落盘。解绑与注销级联清除。
+- Xbox 独立授权请求 `XboxLive.offline_access`：刷新令牌以 AES-GCM（`TOKEN_ENC_KEY`）加密存入
+  `microsoft_tokens`；未配置密钥则拒绝开始。旧混合权限令牌保留但不再使用，用户需在账户页重新授权游戏能力。
 - `POST /auth/v1/minecraft/token` — 启动器端点：用保管的刷新令牌重新派生 XSTS，
-  实时返回经过 Minecraft 服务交换的短时令牌与档案（不存令牌本体），限流 10 次/小时，写审计。
+  实时返回经过 Minecraft 服务交换的短时令牌与档案（不存令牌本体），限流 10 次/小时，写审计。刷新采用 Xbox-only scope；最终写入检查授权版本和会话，撤销中的请求不能恢复档案或取得令牌。
 
 ## 等级、经验与铭牌（migration 0013）
 
