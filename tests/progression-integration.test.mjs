@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { loadLevel, loadProgression, recordActivity, selectLevelDisplay, computeLevel, activityDay } from '../src/progression.mjs';
 import { digest } from '../src/password.mjs';
+import { privacyForAcceptedTerms } from '../src/index.mjs';
 import { createConnectionAuthorization, completeConnectionAuthorization, exchangeConnection, listConnections, unlinkConnection } from '../src/connections.mjs';
 
 test('progression and community bindings use atomic D1 writes', async t => {
@@ -162,7 +163,11 @@ test('progression and community bindings use atomic D1 writes', async t => {
     const status = await (await api('/auth/v1/policies/status', user.token)).json();
     assert.equal(status.policies.find(p => p.kind === 'terms').version, '1.1');
     assert.equal(status.policies.find(p => p.kind === 'terms').acceptedAt, null);
-    assert.equal((await api('/auth/v1/policies/accept', user.token, 'POST', {})).status, 422);
+    const oldPage = await api('/auth/v1/policies/accept', user.token, 'POST', {});
+    assert.equal(oldPage.status, 409); assert.match((await oldPage.json()).detail, /刷新页面.*v1\.1/);
+    assert.equal((await privacyForAcceptedTerms(env, 'terms-1.0')).id, 'privacy-1.0');
+    assert.equal((await privacyForAcceptedTerms(env, 'terms-1.1')).id, 'privacy-1.1');
+    assert.equal(await privacyForAcceptedTerms(env, 'missing-version'), null);
     assert.equal((await api('/auth/v1/policies/accept', user.token, 'POST', { termsVersion: '1.0', privacyVersion: '1.0' })).status, 409);
     const input = { termsVersion: '1.1', privacyVersion: '1.1' };
     const first = await (await api('/auth/v1/policies/accept', user.token, 'POST', input)).json();

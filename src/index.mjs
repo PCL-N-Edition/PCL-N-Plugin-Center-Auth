@@ -99,6 +99,12 @@ async function currentPolicy(env, kind) {
   if (!policy) fail(503, '政策文档尚未配置');
   return policy;
 }
+export async function privacyForAcceptedTerms(env, termsId) {
+  // OAuth may finish after a policy release; record only the notice shown at its start.
+  return env.DB.prepare(`SELECT privacy.* FROM policy_documents privacy JOIN policy_documents terms
+    ON privacy.version=terms.version AND privacy.locale=terms.locale
+    WHERE terms.id=? AND terms.kind='terms' AND privacy.kind='privacy'`).bind(termsId).first();
+}
 async function sessionUser(env, request, scope) {
   const value = credential(request, scope);
   if (!value) fail(401, '请先登录');
@@ -220,12 +226,16 @@ async function oauthCallback(request, env, provider, secure) {
     await env.DB.prepare('UPDATE users SET display_name=?,email=? WHERE id=?').bind(displayName, email, user.id).run();
     if (stateRow.terms_policy_id) {
       // 条款接受与隐私告知随登录原子落库；INSERT OR IGNORE 保证已接受用户不会重复记录。
-      await env.DB.batch([
+      const privacy = await privacyForAcceptedTerms(env, stateRow.terms_policy_id);
+      const records = [
         env.DB.prepare('INSERT OR IGNORE INTO terms_acceptances(user_id,policy_id,accepted_at) VALUES(?,?,?)').bind(user.id, stateRow.terms_policy_id, new Date().toISOString()),
-        auditOnChange(env, user.id, 'terms.accepted', stateRow.terms_policy_id),
-        env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) VALUES(?,?,?)').bind(user.id, (await currentPolicy(env, 'privacy')).id, new Date().toISOString()),
-        auditOnChange(env, user.id, 'privacy.provided', (await currentPolicy(env, 'privacy')).id)
-      ]);
+        auditOnChange(env, user.id, 'terms.accepted', stateRow.terms_policy_id)
+      ];
+      if (privacy) records.push(
+        env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) VALUES(?,?,?)').bind(user.id, privacy.id, new Date().toISOString()),
+        auditOnChange(env, user.id, 'privacy.provided', privacy.id)
+      );
+      await env.DB.batch(records);
     }
     const session = await createSession(env, user, 'console', now, secure);
     headers.append('set-cookie', session.cookie);
@@ -817,7 +827,7 @@ export default {
         const user = await sessionUser(env, request, 'console');
         const input = await body(request);
         const [terms, privacy] = await Promise.all([currentPolicy(env, 'terms'), currentPolicy(env, 'privacy')]);
-        if (typeof input?.termsVersion !== 'string' || typeof input?.privacyVersion !== 'string') fail(422, '请确认当前版本的服务条款与隐私告知');
+        if (typeof input?.termsVersion !== 'string' || typeof input?.privacyVersion !== 'string') fail(409, `页面版本已更新，请刷新页面后阅读并确认服务条款 v${terms.version} 与隐私政策 v${privacy.version}`);
         if (input.termsVersion !== terms.version || input.privacyVersion !== privacy.version) fail(409, '政策版本已更新，请刷新后重新阅读并确认');
         const now = new Date().toISOString();
         await env.DB.batch([
