@@ -54,9 +54,11 @@ test('Xbox exchange follows the official contract and isolates each derived toke
     Properties: { AuthMethod: 'RPS', SiteName: 'user.auth.xboxlive.com', RpsTicket: 'd=msa-xbox-token' }
   });
   const xsts = JSON.parse(calls[1].init.body);
-  assert.equal(xsts.RelyingParty, 'rp://api.minecraftservices.com/');
-  assert.equal(xsts.Properties.SandboxId, 'RETAIL');
-  assert.deepEqual(xsts.Properties.UserTokens, ['xbl-user-token']);
+  // Match the XSTS property contract, not the different User Authentication bag.
+  assert.deepEqual(xsts, {
+    RelyingParty: 'rp://api.minecraftservices.com/', TokenType: 'JWT',
+    Properties: { SandboxId: 'RETAIL', UserTokens: ['xbl-user-token'] }
+  });
   assert.deepEqual(JSON.parse(calls[2].init.body), { platform: 'PC_LAUNCHER', xtoken: 'XBL3.0 x=user-hash;xsts-token' });
   assert.equal(new Headers(calls[2].init.headers).get('x-xbl-contract-version'), null);
   for (const { init } of calls.slice(3)) assert.equal(new Headers(init.headers).get('authorization'), 'Bearer minecraft-token');

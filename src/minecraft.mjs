@@ -48,7 +48,8 @@ export async function fetchMinecraftStatus(accessToken) {
   if (!hasToken(xbl.Token)) throw new AuthFlowError('xbox.user', 'missing_token', { httpStatus: xblStatus, message: 'xbl:missing_token' });
   const { data: xsts, httpStatus: xstsStatus } = await postJson('xbox.xsts', 'https://xsts.auth.xboxlive.com/xsts/authorize', {
     RelyingParty: 'rp://api.minecraftservices.com/', TokenType: 'JWT',
-    Properties: { SandboxId: 'RETAIL', UserTokens: [xbl.Token], SiteName: 'user.auth.xboxlive.com' }
+    // SiteName belongs to User Authentication; it is not an XSTS property.
+    Properties: { SandboxId: 'RETAIL', UserTokens: [xbl.Token] }
   }, xboxHeaders);
   const uhs = xsts?.DisplayClaims?.xui?.[0]?.uhs ?? xbl?.DisplayClaims?.xui?.[0]?.uhs;
   if (!hasToken(uhs) || !hasToken(xsts.Token)) throw new AuthFlowError('xbox.xsts', 'missing_token', { httpStatus: xstsStatus, message: 'xsts:missing_token' });

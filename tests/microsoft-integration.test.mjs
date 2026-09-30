@@ -47,7 +47,10 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       return Response.json({ Token: 'xbl-token' });
     }
     if (url.href === 'https://xsts.auth.xboxlive.com/xsts/authorize') {
-      assert.deepEqual((await request.json()).Properties.UserTokens, ['xbl-token']);
+      assert.deepEqual(await request.json(), {
+        RelyingParty: 'rp://api.minecraftservices.com/', TokenType: 'JWT',
+        Properties: { SandboxId: 'RETAIL', UserTokens: ['xbl-token'] }
+      });
       return Response.json({ Token: 'xsts-token', DisplayClaims: { xui: [{ uhs: 'game-user-hash' }] } });
     }
     if (url.href === 'https://api.minecraftservices.com/launcher/login') {
