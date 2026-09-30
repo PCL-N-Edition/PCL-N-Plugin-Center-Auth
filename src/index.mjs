@@ -6,6 +6,8 @@ import { randomSecret, otpauthUrl, verifyTotp, encryptSecret, decryptSecret } fr
 import { generateRecoveryCodes, hashRecoveryCode } from './recovery.mjs';
 import { verifyRegistration, verifyAssertion, webauthnUserId } from './webauthn.mjs';
 import { fetchMinecraftStatus } from './minecraft.mjs';
+import { loadLevel, loadProgression, selectLevelDisplay, recordActivity, readActivity, validateVerification } from './progression.mjs';
+import { listConnections, createConnectionAuthorization, completeConnectionAuthorization, unlinkConnection } from './connections.mjs';
 class Failure extends Error { constructor(status, detail) { super(detail); this.status = status; } }
 const fail = (status, detail) => { throw new Failure(status, detail); };
 const cookieName = scope => scope === 'operations' ? 'nexa_staff' : 'nexa_console';
@@ -40,33 +42,6 @@ const RP_ID = env => env.RP_ID || (env.LOCAL_DEV === 'true' ? 'localhost' : 'pcl
 const webauthnOrigins = env => [env.WEB_ORIGIN, 'https://auth.pcln.top', ...(env.LOCAL_DEV === 'true' ? ['http://127.0.0.1:5730', 'http://localhost:5730'] : [])].filter(Boolean);
 const clientIp = request => request.headers.get('cf-connecting-ip') || 'unknown';
 const hasRealPassword = hash => Boolean(hash) && !hash.startsWith('oauth:') && !hash.startsWith('system:');
-// ---------- 等级与经验 ----------
-// Lv0→1:启动一次游戏(launched 标记);Lv2~7:累计经验达到阈值。
-const LEVEL_THRESHOLDS = { 2: 2000, 3: 5000, 4: 10000, 5: 20000, 6: 50000, 7: 100000 };
-const XP_RULES = {
-  'game.first_launch': { xp: 100, once: true, setsLaunched: true },
-  'game.launch': { xp: 10 },
-  'game.play_minutes': { xpPerUnit: 1 },   // amount = 游玩分钟数
-  'install.complete': { xp: 20 },
-  'resource.download': { xp: 5 }
-};
-const XP_DAILY_CAP = 500; // 每用户每 UTC 日通过事件累计的经验上限(game.first_launch 豁免)
-function computeLevel(xp, launched) {
-  if (!launched) return 0;
-  let level = 1;
-  for (let l = 2; l <= 7; l++) { if (xp >= LEVEL_THRESHOLDS[l]) level = l; else break; }
-  return level;
-}
-async function loadLevel(env, userId) {
-  const row = await env.DB.prepare('SELECT xp, launched, first_launch_at FROM user_levels WHERE user_id=?').bind(userId).first();
-  const xp = row?.xp ?? 0, launched = row?.launched ? 1 : 0;
-  const level = computeLevel(xp, launched);
-  const nextLevel = level < 7 ? level + 1 : null;
-  return {
-    level, xp, launched: Boolean(launched), firstLaunchAt: row?.first_launch_at ?? null,
-    next: nextLevel ? { level: nextLevel, threshold: LEVEL_THRESHOLDS[nextLevel], remaining: Math.max(0, LEVEL_THRESHOLDS[nextLevel] - xp) } : null
-  };
-}
 const serviceAuth = (request, env) => {
   const token = (request.headers.get('authorization') || '').replace(/^Bearer /, '');
   if (!env.SERVICE_TOKEN || token !== env.SERVICE_TOKEN) fail(401, '服务凭据无效');
@@ -248,7 +223,8 @@ async function oauthCallback(request, env, provider, secure) {
       await env.DB.batch([
         env.DB.prepare('INSERT OR IGNORE INTO terms_acceptances(user_id,policy_id,accepted_at) VALUES(?,?,?)').bind(user.id, stateRow.terms_policy_id, new Date().toISOString()),
         auditOnChange(env, user.id, 'terms.accepted', stateRow.terms_policy_id),
-        env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) SELECT ?,?,? WHERE changes()=1').bind(user.id, (await currentPolicy(env, 'privacy')).id, new Date().toISOString())
+        env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) VALUES(?,?,?)').bind(user.id, (await currentPolicy(env, 'privacy')).id, new Date().toISOString()),
+        auditOnChange(env, user.id, 'privacy.provided', (await currentPolicy(env, 'privacy')).id)
       ]);
     }
     const session = await createSession(env, user, 'console', now, secure);
@@ -274,6 +250,13 @@ export async function finalizeAccountDeletion(env, requestId, userId) {
     env.DB.prepare('DELETE FROM user_flags WHERE user_id=?').bind(userId),
     env.DB.prepare('DELETE FROM xp_events WHERE user_id=?').bind(userId),
     env.DB.prepare('DELETE FROM user_levels WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM launcher_presence WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM launcher_activity_days WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM launcher_activity_events WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM badge_verifications WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM user_level_display WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM external_connections WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM connection_authorizations WHERE user_id=?').bind(userId),
     env.DB.prepare("UPDATE users SET name=?, display_name=NULL, email=NULL, user_handle=NULL, password_hash='system:deleted', password_set_at=NULL, disabled=1, staff=0, developer=0, trusted_developer=0 WHERE id=? AND disabled=0").bind('deleted:' + userId, userId),
     env.DB.prepare("UPDATE account_deletion_requests SET state='finalized', finalized_at=?, version=version+1 WHERE id=? AND state='pending'").bind(now, requestId),
     env.DB.prepare('INSERT INTO deletion_tombstones(subject_id,deleted_at,deletion_version,reason) VALUES(?,?,1,?) ON CONFLICT(subject_id) DO UPDATE SET deleted_at=excluded.deleted_at, deletion_version=deletion_tombstones.deletion_version+1').bind(userId, now, 'user_requested'),
@@ -287,6 +270,8 @@ export async function runAuthMaintenance(env) {
     env.DB.prepare('DELETE FROM sessions WHERE expires<?').bind(now),
     env.DB.prepare('DELETE FROM oauth_states WHERE expires<? OR (consumed=1 AND expires<?)').bind(now, now - 86400000),
     env.DB.prepare('DELETE FROM rate_limits WHERE expires<?').bind(now),
+    env.DB.prepare('DELETE FROM launcher_activity_events WHERE occurred_at<?').bind(new Date(now - 30 * 86400000).toISOString()),
+    env.DB.prepare('DELETE FROM connection_authorizations WHERE expires<? OR consumed=1').bind(now),
     env.DB.prepare('DELETE FROM login_challenges WHERE expires<?').bind(now - 86400000),
     env.DB.prepare('DELETE FROM mfa_totp WHERE confirmed=0 AND created_at<?').bind(new Date(now - 900000).toISOString()),
     env.DB.prepare('DELETE FROM users WHERE confirmed_at IS NULL AND created_at<?').bind(new Date(now - 86400000).toISOString())
@@ -310,6 +295,22 @@ export default {
       if (!path.startsWith('/internal/') && !['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
       const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft|google)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
+      const connectionPath = path.match(/^\/auth\/v1\/connections\/(bilibili|afdian)(?:\/(authorizations|callback))?$/);
+      if (connectionPath?.[2] === 'callback' && request.method === 'GET') return await completeConnectionAuthorization(request, env, connectionPath[1]);
+      if (path === '/auth/v1/connections' && request.method === 'GET') return json(env, await listConnections(env, (await sessionUser(env, request, 'console')).id));
+      if (connectionPath) {
+        const user = await sessionUser(env, request, 'console');
+        if (connectionPath[2] === 'authorizations' && request.method === 'POST') {
+          await rateLimit(env, 'connection:' + user.id, 20, 3600000, '授权请求过于频繁');
+          const result = await createConnectionAuthorization(env, user, credential(request, 'console'), connectionPath[1]);
+          return json(env, { url: result.url }, 201, { 'set-cookie': result.cookie });
+        }
+        if (!connectionPath[2] && request.method === 'DELETE') {
+          await unlinkConnection(env, user.id, connectionPath[1]);
+          return new Response(null, { status: 204, headers: { 'cache-control': 'no-store', ...cors(env) } });
+        }
+        fail(405, '方法不支持');
+      }
       if (path === '/auth/v1/sessions' && request.method === 'POST') fail(404, '接口不存在');
       if (path === '/auth/v1/tokens' && request.method === 'POST') {
         const scope = scopeOf(url.searchParams.get('scope') || 'console');
@@ -527,49 +528,24 @@ export default {
         if (!status.owned) fail(403, '该 Microsoft 账户未拥有 Minecraft');
         return json(env, { accessToken: status.accessToken, profileId: status.profileId, profileName: status.profileName, owned: true });
       }
-      // ---------- 内部服务通道(启动器遥测 → nexa-api → 此处;SERVICE_TOKEN 鉴权) ----------
-      if (path === '/internal/v1/xp' && request.method === 'POST') {
+      // 启动器活动由 nexa-api 验证 mTLS；Auth 再验证账户，使用服务器时间计分。
+      const activityPath = path.match(/^\/internal\/v1\/launcher\/activity-events(?:\/([0-9a-f-]+))?$/i);
+      if (activityPath) {
         serviceAuth(request, env);
-        const input = await body(request, 16384);
-        const user = await env.DB.prepare('SELECT id FROM users WHERE disabled=0 AND (id=? OR user_handle=?)').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
-        if (!user) fail(404, '用户不存在');
-        if (!Array.isArray(input?.events) || !input.events.length || input.events.length > 100) fail(400, 'events 需为 1–100 条');
-        let applied = 0, ignored = 0;
-        // 额度、首启和幂等检查均在 D1 原子批次中执行，避免并发计分超过上限。
-        let current = await loadLevel(env, user.id);
-        for (const event of input.events.slice(0, 100)) {
-          const rule = XP_RULES[String(event?.type ?? '')];
-          if (!rule) { ignored++; continue; }
-          const dedupeKey = typeof event?.dedupeKey === 'string' && event.dedupeKey ? event.dedupeKey.slice(0, 120) : null;
-          if (rule.once) {
-            const done = await env.DB.prepare('SELECT 1 FROM xp_events WHERE user_id=? AND type=?').bind(user.id, event.type).first();
-            if (done) { ignored++; continue; }
-          }
-          const units = rule.xpPerUnit ? Math.floor(Math.max(0, Math.min(600, Number(event?.amount) || 0))) : 1;
-          if (rule.xpPerUnit && units === 0) { ignored++; continue; }
-          const gain = rule.xpPerUnit ? units : rule.xp;
-          const timestamp = event?.occurredAt === undefined ? Date.now() : Date.parse(event.occurredAt);
-          if (!Number.isFinite(timestamp) || timestamp > Date.now() + 300000) fail(400, '事件时间无效');
-          const occurredAt = new Date(timestamp).toISOString();
-          const nowIso = new Date().toISOString();
-          const statements = [
-            env.DB.prepare(`INSERT OR IGNORE INTO xp_events(user_id,type,amount,dedupe_key,occurred_at,created_at)
-              SELECT ?,?,gain,?,?,? FROM (
-                SELECT CASE WHEN ?=1 THEN ? ELSE min(?,max(0,?-(
-                  SELECT COALESCE(sum(amount),0) FROM xp_events WHERE user_id=? AND substr(occurred_at,1,10)=? AND type!='game.first_launch'
-                ))) END AS gain
-              ) WHERE gain>0`).bind(user.id, String(event.type), dedupeKey, occurredAt, nowIso, rule.once ? 1 : 0, gain, gain, XP_DAILY_CAP, user.id, occurredAt.slice(0, 10))
-          ];
-          if (rule.setsLaunched) {
-            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,first_launch_at,updated_at) SELECT user_id,amount,1,occurred_at,created_at FROM xp_events WHERE id=last_insert_rowid() AND changes()=1 ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, launched=1, first_launch_at=COALESCE(user_levels.first_launch_at,excluded.first_launch_at), updated_at=excluded.updated_at'));
-          } else {
-            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,updated_at) SELECT user_id,amount,0,created_at FROM xp_events WHERE id=last_insert_rowid() AND changes()=1 ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, updated_at=excluded.updated_at'));
-          }
-          const [inserted] = await env.DB.batch(statements);
-          if (inserted.meta.changes) applied++; else ignored++;
-          current = await loadLevel(env, user.id);
-        }
-        return json(env, { applied, ignored, xp: current.xp, level: current.level });
+        if (request.method !== (activityPath[1] ? 'GET' : 'POST')) fail(405, '方法不支持');
+        const accountToken = request.headers.get('x-nexa-account-token');
+        if (!accountToken) fail(401, '缺少账户登录凭据');
+        const user = await sessionUser(env, new Request('https://auth.internal', { headers: { authorization: 'Bearer ' + accountToken } }), 'console');
+        if (user.setupRequired || !user.termsAccepted) fail(403, '请先完成注册并接受服务条款');
+        if (activityPath[1]) return json(env, await readActivity(env, user.id, activityPath[1].toLowerCase()));
+        await rateLimit(env, 'activity:' + user.id, 60, 60000, '活动上报过于频繁');
+        const input = await body(request);
+        const result = await recordActivity(env, user, request.headers.get('x-nexa-client-certificate') || '', input);
+        return json(env, result, result.created ? 201 : 200, { location: '/api/v1/launcher/activity-events/' + result.event.id });
+      }
+      if (path === '/internal/v1/xp') {
+        serviceAuth(request, env);
+        fail(410, '经验写入已迁移至mTLS启动器活动接口');
       }
       if (path === '/internal/v1/flags' && request.method === 'POST') {
         serviceAuth(request, env);
@@ -584,10 +560,32 @@ export default {
         return json(env, { ok: true });
       }
       // ---------- 等级 / 资格申请 ----------
+      if (path === '/auth/v1/account/level-display' && request.method === 'PUT') {
+        const user = await sessionUser(env, request, 'console');
+        return json(env, await selectLevelDisplay(env, user, await body(request)));
+      }
+      const verificationPath = path.match(/^\/auth\/v1\/users\/([^/]+)\/badge-verifications\/([^/]+)$/);
+      if (verificationPath && request.method === 'PUT') {
+        const reviewer = await sessionUser(env, request, 'console');
+        if (!reviewer.staff) fail(403, '仅网站管理员可核验');
+        const target = decodeURIComponent(verificationPath[1]), badgeId = verificationPath[2];
+        const user = await env.DB.prepare('SELECT id FROM users WHERE disabled=0 AND (id=? OR user_handle=?)').bind(target, target).first();
+        if (!user) fail(404, '账户不存在');
+        if (user.id === reviewer.id) fail(403, '不能审核自己的铭牌');
+        const input = validateVerification(badgeId, await body(request));
+        await rateLimit(env, 'badge-review:' + reviewer.id, 30, 3600000, '核验操作过于频繁');
+        await env.DB.batch([
+          env.DB.prepare(`INSERT INTO badge_verifications(user_id,badge_id,verified_value,source_account,evidence,reviewer,verified_at) VALUES(?,?,?,?,?,?,?)
+            ON CONFLICT(user_id,badge_id) DO UPDATE SET verified_value=excluded.verified_value,source_account=excluded.source_account,evidence=excluded.evidence,reviewer=excluded.reviewer,verified_at=excluded.verified_at
+            WHERE verified_value!=excluded.verified_value OR source_account!=excluded.source_account OR evidence!=excluded.evidence`).bind(user.id, badgeId, input.value, input.sourceAccount, input.evidence, reviewer.id, new Date().toISOString()),
+          auditOnChange(env, reviewer.id, 'badge.verified', `${user.id}:${badgeId}:${input.value}`)
+        ]);
+        return json(env, { userId: user.id, badgeId, value: input.value });
+      }
       if (path === '/auth/v1/account/level' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
         const [level, popular, apps, profile] = await Promise.all([
-          loadLevel(env, user.id),
+          loadProgression(env, user),
           env.DB.prepare("SELECT value, set_at FROM user_flags WHERE user_id=? AND flag='popular_plugin'").bind(user.id).first(),
           env.DB.prepare('SELECT id,kind,state,note,created_at,reviewed_at FROM applications WHERE user_id=? ORDER BY created_at DESC LIMIT 20').bind(user.id).all(),
           env.DB.prepare('SELECT staff, developer, trusted_developer FROM users WHERE id=?').bind(user.id).first()
@@ -817,20 +815,28 @@ export default {
       }
       if (path === '/auth/v1/policies/accept' && request.method === 'POST') {
         const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
         const [terms, privacy] = await Promise.all([currentPolicy(env, 'terms'), currentPolicy(env, 'privacy')]);
+        if (typeof input?.termsVersion !== 'string' || typeof input?.privacyVersion !== 'string') fail(422, '请确认当前版本的服务条款与隐私告知');
+        if (input.termsVersion !== terms.version || input.privacyVersion !== privacy.version) fail(409, '政策版本已更新，请刷新后重新阅读并确认');
         const now = new Date().toISOString();
         await env.DB.batch([
-          env.DB.prepare('INSERT OR IGNORE INTO terms_acceptances(user_id,policy_id,accepted_at) VALUES(?,?,?)').bind(user.id, terms.id, now),
+          env.DB.prepare('INSERT OR IGNORE INTO terms_acceptances(user_id,policy_id,accepted_at) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM policy_documents WHERE id=? AND current=1) AND EXISTS(SELECT 1 FROM policy_documents WHERE id=? AND current=1)').bind(user.id, terms.id, now, terms.id, privacy.id),
           auditOnChange(env, user.id, 'terms.accepted', terms.id),
-          env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) SELECT ?,?,? WHERE changes()=1').bind(user.id, privacy.id, now)
+          env.DB.prepare('INSERT OR IGNORE INTO privacy_notice_receipts(user_id,policy_id,provided_at) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM policy_documents WHERE id=? AND current=1) AND EXISTS(SELECT 1 FROM policy_documents WHERE id=? AND current=1)').bind(user.id, privacy.id, now, terms.id, privacy.id),
+          auditOnChange(env, user.id, 'privacy.provided', privacy.id)
         ]);
-        return json(env, { ok: true, terms: { kind: 'terms', version: terms.version, effectiveAt: terms.effective_at, contentHash: terms.content_hash, acceptedAt: now } });
+        const acceptance = await env.DB.prepare('SELECT accepted_at FROM terms_acceptances WHERE user_id=? AND policy_id=?').bind(user.id, terms.id).first();
+        if (!acceptance) fail(409, '政策版本已更新，请刷新后重新确认');
+        return json(env, { ok: true, terms: { kind: 'terms', version: terms.version, effectiveAt: terms.effective_at, contentHash: terms.content_hash, acceptedAt: acceptance.accepted_at } });
       }
       if (path === '/auth/v1/policies/status' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const rows = await env.DB.prepare(`SELECT pd.kind,pd.version,pd.effective_at AS effectiveAt,pd.content_hash AS contentHash,ta.accepted_at AS acceptedAt
+        const rows = await env.DB.prepare(`SELECT pd.kind,pd.version,pd.effective_at AS effectiveAt,pd.content_hash AS contentHash,
+          CASE WHEN pd.kind='privacy' THEN pr.provided_at ELSE ta.accepted_at END AS acceptedAt
           FROM policy_documents pd LEFT JOIN terms_acceptances ta ON ta.policy_id=pd.id AND ta.user_id=?
-          WHERE pd.current=1 AND pd.kind IN ('terms','privacy') ORDER BY pd.kind`).bind(user.id).all();
+          LEFT JOIN privacy_notice_receipts pr ON pr.policy_id=pd.id AND pr.user_id=?
+          WHERE pd.current=1 AND pd.kind IN ('terms','privacy') ORDER BY pd.kind`).bind(user.id, user.id).all();
         return json(env, { policies: rows.results });
       }
       if (path === '/auth/v1/identities' && request.method === 'GET') {
@@ -894,14 +900,20 @@ export default {
       }
       if (path === '/auth/v1/account/export' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const [identities, sessions, acceptances, deletion, privacy, mfa, minecraft] = await Promise.all([
+        const [identities, sessions, acceptances, deletion, privacy, mfa, minecraft, progression, badgeProofs, connections, activityDays, activityEvents] = await Promise.all([
           env.DB.prepare('SELECT provider,subject,email,created_at,updated_at FROM oauth_identities WHERE user_id=?').bind(user.id).all(),
           env.DB.prepare("SELECT scope, CASE WHEN expires>? THEN 'active' ELSE 'expired' END AS state FROM sessions WHERE user_id=?").bind(Date.now(), user.id).all(),
-          env.DB.prepare('SELECT pd.kind,pd.version,ta.accepted_at AS acceptedAt FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id WHERE ta.user_id=?').bind(user.id).all(),
+          env.DB.prepare(`SELECT pd.kind,pd.version,ta.accepted_at AS acceptedAt FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id WHERE ta.user_id=?
+            UNION ALL SELECT pd.kind,pd.version,pr.provided_at AS acceptedAt FROM privacy_notice_receipts pr JOIN policy_documents pd ON pd.id=pr.policy_id WHERE pr.user_id=?`).bind(user.id, user.id).all(),
           env.DB.prepare('SELECT id,state,requested_at AS requestedAt,execute_after AS executeAfter,cancelled_at AS cancelledAt,finalized_at AS finalizedAt FROM account_deletion_requests WHERE user_id=?').bind(user.id).first(),
           env.DB.prepare('SELECT id,request_type AS type,state,created_at AS createdAt,updated_at AS updatedAt FROM privacy_requests WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
           loadFactors(env, user.id),
-          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first()
+          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first(),
+          loadProgression(env, user),
+          env.DB.prepare('SELECT badge_id,verified_value,source_account,evidence,verified_at FROM badge_verifications WHERE user_id=?').bind(user.id).all(),
+          env.DB.prepare('SELECT provider,subject,private_subject,display_name,followers,connected_at,checked_at FROM external_connections WHERE user_id=?').bind(user.id).all(),
+          env.DB.prepare('SELECT day,logged_in,game_started,launcher_ms,game_ms,xp_earned FROM launcher_activity_days WHERE user_id=? ORDER BY day').bind(user.id).all(),
+          env.DB.prepare('SELECT id,type,certificate,xp,occurred_at FROM launcher_activity_events WHERE user_id=? ORDER BY occurred_at').bind(user.id).all()
         ]);
         return json(env, {
           profile: { id: user.id, name: user.name, email: user.email, staff: user.staff, developer: user.developer, handle: user.handle ?? null },
@@ -909,6 +921,8 @@ export default {
           deletionRequest: deletion ?? null, privacyRequests: privacy.results,
           mfa: { factors: mfa.list, passkeys: mfa.passkeyCount, totp: mfa.totpCount, recoveryCodes: mfa.recoveryCount },
           minecraft: minecraft ? { owned: minecraft.owned, profileId: minecraft.profile_id, profileName: minecraft.profile_name, checkedAt: minecraft.checked_at } : null,
+          progression, badgeVerifications: badgeProofs.results, connections: connections.results,
+          activityDays: activityDays.results, activityEvents: activityEvents.results,
           exportedAt: new Date().toISOString()
         });
       }

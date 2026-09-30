@@ -101,20 +101,11 @@ test('account and MFA endpoints run against actual Worker D1', async t => {
     assert.equal(session.setupRequired, 0); assert.equal(session.handle, 'newuser');
     assert.equal((await call('/auth/v1/register/complete', { method: 'POST', token: pending, data: {} })).status, 409);
   });
-  await t.test('internal XP requires service credentials and replay is idempotent', async () => {
-    const data = { user: 'aliceid', events: [{ type: 'game.first_launch', dedupeKey: 'first' }] };
-    assert.equal((await call('/internal/v1/xp', { method: 'POST', token: user, data })).status, 401);
-    const apply = () => call('/internal/v1/xp', { method: 'POST', token: 'test-only-service-token', data });
-    assert.equal((await (await apply()).json()).xp, 100);
-    assert.equal((await (await apply()).json()).xp, 100);
+  await t.test('legacy XP writes are retired and the replacement requires a trusted service', async () => {
+    assert.equal((await call('/internal/v1/xp', { method: 'POST', token: user, data: {} })).status, 401);
+    assert.equal((await call('/internal/v1/xp', { method: 'POST', token: 'test-only-service-token', data: {} })).status, 410);
+    assert.equal((await call('/internal/v1/launcher/activity-events', { method: 'POST', token: user, data: {} })).status, 401);
     assert.equal((await call('/auth/v1/applications', { method: 'POST', token: user, data: { kind: 'admin' } })).status, 403);
-    const concurrent = payload => call('/internal/v1/xp', { method: 'POST', token: 'test-only-service-token', data: payload });
-    await addUser('parallelid');
-    await Promise.all(['one','two'].map(dedupeKey => concurrent({ user: 'parallelid', events: [{ type: 'game.first_launch', dedupeKey }] })));
-    assert.equal((await db.prepare("SELECT xp FROM user_levels WHERE user_id='parallelid'").first()).xp, 100);
-    await Promise.all(['minutes-one','minutes-two'].map(dedupeKey => concurrent({ user: 'parallelid', events: [{ type: 'game.play_minutes', amount: 400, dedupeKey }] })));
-    assert.equal((await db.prepare("SELECT xp FROM user_levels WHERE user_id='parallelid'").first()).xp, 600);
-    assert.equal((await concurrent({ user: 'parallelid', events: [{ type: 'game.launch', occurredAt: 'not-a-date' }] })).status, 400);
   });
   await t.test('competing role reviews cannot both change permissions', async () => {
     const applicant = await addUser('candidate');

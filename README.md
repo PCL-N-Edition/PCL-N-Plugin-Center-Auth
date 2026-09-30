@@ -74,19 +74,33 @@ Web 在 auth 域使用 HttpOnly Cookie 会话，换取仅存内存的 API Bearer
 - `POST /auth/v1/minecraft/token` — 启动器端点：用保管的刷新令牌重新派生 XSTS，
   实时返回经过 Minecraft 服务交换的短时令牌与档案（不存令牌本体），限流 10 次/小时，写审计。
 
-## 等级与经验系统（migration 0010）
+## 等级、经验与铭牌（migration 0013）
 
-- **Lv0~7**：Lv0→1 需启动一次游戏（`game.first_launch`，一次性）；Lv2~7 按累计经验
-  **2k / 5k / 10k / 20k / 50k / 100k**。等级由服务端按 `xp + launched` 实时计算，不存冗余字段。
-- 经验事件（`XP_RULES` 可调）：首启 +100、游戏启动 +10、游玩每分钟 +1、完成安装 +20、资源下载 +5；
-  每用户每“事件发生日”上限 500（首启豁免），`dedupeKey` 幂等防重放。
-- **内部通道**（`SERVICE_TOKEN` Bearer 鉴权，豁免浏览器 Origin 检查，供 nexa-api/遥测管道调用）：
-  - `POST /internal/v1/xp` `{user, events:[{type, amount?, dedupeKey?, occurredAt?}]}`
-  - `POST /internal/v1/flags` `{user, flag, value}` — 如商店侧写入 `popular_plugin`（下载量>1k 证据）
-- 用户端 `GET /auth/v1/account/level` — 等级/经验/下一级进度/角色/资格达成情况/我的申请；
-  会话与 `/tokens` 响应也携带 `level`、`xp`、`trustedDeveloper`。
-- **资格申请**（`POST /auth/v1/applications`）：developer 需 Lv2；trusted_developer 需
-  developer + Lv3 + `popular_plugin` 标记；admin 需 Lv4。同类 pending 唯一；已具备角色 409。
-- **审批**（staff）：`GET /applications/pending`、`POST /applications/:id/review {decision,note}`；
-  不能审批自己的申请；批准即写 `users.developer / trusted_developer / staff`，全程审计。
+- Lv0→1 需当前登录账户通过受信启动器首次启动 MC。Lv2～7 累计经验为 2000 / 5000 / 10000 / 20000 / 50000 / 100000。
+- 每日登录启动器 +20、每日首次启动 MC +30、MC 在线每分钟 +1、启动器在线每 5 分钟 +1；上海时间按日合计最多 500。所有时间由服务器计算，不接受客户端金额、用户 ID、时间或经验值。
+- `GET /auth/v1/account/level` 返回普通等级、Exp、在线时长、连续天数、铭牌与展示选择；`PUT /auth/v1/account/level-display` 的 `{badgeId:null}` 恢复普通等级。
+- Lv-1 随当前管理员身份即时变化；LvMC 需要曾连续 100 天启动 MC；Lv∞ 需要 Lv7、MC 100h 和∞答题，题库未开放时不能授予。
+- B站 Lv6、百万粉丝及累计无偿捐赠严格超过 1000 元的铭牌由管理员用 `PUT /auth/v1/users/{id或handle}/badge-verifications/{badgeId}` 核验，金额单位分。提交 `{value,sourceAccount,evidence}`，禁止审核自己，结果及更正写审计。订阅付款与爱发电 OAuth 绑定不等于无偿捐赠证明。
+- 已退役 `POST /internal/v1/xp` 返回 410。新的可信接口是 `POST /internal/v1/launcher/activity-events` 与 `GET /internal/v1/launcher/activity-events/{UUID}`：SERVICE_TOKEN + `x-nexa-account-token` 真实用户会话 + `x-nexa-client-certificate` 已由 Web 验证的证书指纹。只能由 API 调用，原始匿名遥测不进入此通道。
+- 请求 `{id:UUID,type}`，type 为 launcher.login / launcher.heartbeat / launcher.logout / game.start / game.heartbeat / game.stop；创建返回 201 和 Location，重复相同事件返回 200，冲突返回 409。最长心跳间隔 120 秒、每次最多计 90 秒，离线不补时，多设备不重叠累计。事件回执保留 30 天，累计时间、按日经验与铭牌随账户保存；注销清除。
+- 启动器接口当前仅预留，未修改启动器。证书验证与吊销交由 Cloudflare Client Certificates；Web 仅采用 Cloudflare TLS 校验结果，缺少有效证书就拒绝。启用流程见 API `nexa/README.md`。
+- 资格申请保留原有要求：developer Lv2，trusted_developer 需 developer + Lv3 + popular_plugin，admin Lv4；管理员不得审批自己，批准/拒绝有审计。
 
+## 社区绑定（migration 0014）
+
+爱发电绑定独立于登录身份：`GET /auth/v1/connections`，`POST /auth/v1/connections/afdian/authorizations`，授权回调 `GET /auth/v1/connections/afdian/callback`，解绑 `DELETE /auth/v1/connections/afdian`。绑定不能直接用于登录 Nexa。
+
+客户端 ID 与密钥只保存在 Cloudflare Secrets，可在此仓库运行：
+
+```powershell
+pnpm exec wrangler secret put AFDIAN_CLIENT_ID
+pnpm exec wrangler secret put AFDIAN_CLIENT_SECRET
+```
+
+代码在授权及换取身份时传递 redirect_uri=https://auth.pcln.top/auth/v1/connections/afdian/callback。只请求 basic，接受官方只返回 user_id 的响应，不强求 access_token、邮箱或昵称，不保存第三方访问令牌。10 分钟单次 state 同时绑定当前 Nexa 会话与 HttpOnly Cookie；退出、解绑、过期或重放都会拒绝。数据库唯一约束防止跨账户抢占第三方身份。
+
+B站签名绑定暂未开放：2026-10-01 本机公开资料读取成功，但 Cloudflare 实测返回 412。公开资料适配层和 80-bit 文学编码器作为原型保留；词库仍待人工审校，不收集 Cookie/SESSDATA、不模拟扫码登录。需公开资料读取稳定、签名更新延迟测试和词库审校通过后，才推进挑战与绑定页面。编码容量与证明见 `docs/bilibili-encoder.md`。
+
+## 政策版本与隐私记录
+
+服务条款接受与隐私告知分别存储，隐私状态读取 privacy_notice_receipts，不依赖条款审计语句是否新插入。migration 0012 只修复已知 v1.0 联合确认流程的漏记，不推断新版本已接受。政策版本更新时必须同步 Web 版本常量、文本哈希和 Auth policy_documents；旧版本及接受记录保留，新版本不自动代签。
