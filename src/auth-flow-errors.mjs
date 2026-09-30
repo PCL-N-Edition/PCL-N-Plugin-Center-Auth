@@ -1,5 +1,5 @@
 const stages = new Set(['microsoft.token', 'xbox.user', 'xbox.xsts', 'minecraft.login', 'minecraft.entitlements', 'minecraft.profile', 'grant.store', 'grant.save', 'unknown']);
-const reasons = new Set(['http_error', 'network_error', 'timeout', 'invalid_response', 'missing_token', 'missing_refresh_token', 'app_not_permitted', 'configuration_missing', 'storage_error', 'state_changed', 'unexpected']);
+const reasons = new Set(['http_error', 'connection_rejected', 'network_error', 'timeout', 'invalid_response', 'missing_token', 'missing_refresh_token', 'app_not_permitted', 'configuration_missing', 'storage_error', 'state_changed', 'unexpected']);
 
 export class AuthFlowError extends Error {
   constructor(stage, reason, { httpStatus, providerCode, message, tokenFacts, responseFormat } = {}) {
@@ -45,6 +45,7 @@ export function gameAuthorizationMessage(diagnostic) {
   if (diagnostic.reason === 'state_changed') message = '游戏授权已失效或被撤销，请重新开始';
   else if (diagnostic.reason === 'missing_refresh_token') message = 'Microsoft 未返回持续授权令牌，游戏授权尚未保存';
   else if (diagnostic.reason === 'app_not_permitted') message = '当前网站应用未获准访问 Minecraft 服务，需由管理员处理';
+  else if (diagnostic.reason === 'connection_rejected') message = 'Minecraft 接口访问被拒绝，当前无法完成授权，需由管理员处理';
   else if (diagnostic.stage === 'xbox.xsts' && diagnostic.providerCode === 2148916233) message = '所选 Microsoft 账户尚未创建 Xbox 资料，请先在 Xbox 完成账户设置';
   else if (diagnostic.reason === 'timeout') message = `${labels[diagnostic.stage] || labels.unknown}超时，请稍后重试`;
   else if (diagnostic.reason === 'network_error') message = `${labels[diagnostic.stage] || labels.unknown}连接失败，请稍后重试`;

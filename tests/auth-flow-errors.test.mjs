@@ -130,3 +130,14 @@ test('response format diagnostics accept only fixed categories, never raw Conten
     assert.doesNotMatch(JSON.stringify(diagnosticOf(error)) + messageOf(error), /header-secret|body-secret|object-secret/);
   }
 });
+
+test('connection rejection explains the administrator action without inventing an account or app-permission cause', () => {
+  const error = new AuthFlowError('minecraft.login', 'connection_rejected', { httpStatus: 403, responseFormat: 'html', message: 'private-upstream-secret' });
+  const diagnostic = diagnosticOf(error);
+  assert.equal(diagnostic.reason, 'connection_rejected');
+  const message = gameAuthorizationMessage(diagnostic);
+  assert.match(message, /Minecraft 接口访问被拒绝，当前无法完成授权，需由管理员处理/);
+  assert.match(message, /HTTP 403/);
+  assert.ok(message.includes(reference));
+  assert.doesNotMatch(message, /稍后重试|尚未创建 Xbox|网站应用未获准|private-upstream-secret/);
+});

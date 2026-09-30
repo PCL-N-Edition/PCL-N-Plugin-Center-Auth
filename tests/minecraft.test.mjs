@@ -221,7 +221,7 @@ test('Minecraft login failures classify response media without logging headers o
       const response = new Response(privateUpstreamText, { status: 403, headers: { 'content-type': contentType } });
       const calls = mockExchange(sub, { 2: response });
       await assert.rejects(fetchMinecraftStatus('msa-xbox-token'), error => {
-        assert.equal(error.stage, 'minecraft.login'); assert.equal(error.reason, 'http_error');
+        assert.equal(error.stage, 'minecraft.login'); assert.equal(error.reason, responseFormat === 'html' ? 'connection_rejected' : 'http_error');
         assert.equal(error.responseFormat, responseFormat);
         assert.equal(safeAuthDiagnostic(error, diagnosticReference).responseFormat, responseFormat);
         assertSafeFailure(error);
@@ -229,6 +229,22 @@ test('Minecraft login failures classify response media without logging headers o
         return true;
       });
       assert.equal(calls.length, 3);
+    });
+  }
+});
+
+test('only Minecraft HTML 403 responses become connection rejection; no failure returns ownership', async t => {
+  for (const [index, stage] of stages.entries()) {
+    for (const status of [403, 503]) await t.test(`${stage} / ${status}`, async sub => {
+      const calls = mockExchange(sub, { [index]: new Response(`<html>${privateUpstreamText}</html>`, { status, headers: { 'content-type': 'text/html' } }) });
+      await assert.rejects(fetchMinecraftStatus('msa-xbox-token'), error => {
+        assert.equal(error.reason, stage.startsWith('minecraft.') && status === 403 ? 'connection_rejected' : 'http_error');
+        assert.equal(error.stage, stage);
+        assert.equal(error.httpStatus, status);
+        assertSafeFailure(error);
+        return true;
+      });
+      assert.equal(calls.length, index + 1);
     });
   }
 });

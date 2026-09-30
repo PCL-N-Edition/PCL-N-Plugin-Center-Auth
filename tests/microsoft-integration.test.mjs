@@ -22,6 +22,7 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
     }
     if (upstreamOverride?.hostname === url.hostname && upstreamOverride.path === url.pathname) {
       const fixture = upstreamOverride; upstreamOverride = null;
+      if (fixture.responseFormat === 'html') return new Response(fixture.body, { status: fixture.status, headers: { 'content-type': 'text/html; charset=utf-8' } });
       return Response.json(fixture.body, { status: fixture.status });
     }
     if (url.hostname === 'login.microsoftonline.com') {
@@ -178,6 +179,11 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
         message: /Minecraft 服务登录未完成/
       },
       {
+        id: 'minecraft-html-rejection', step: 3, stage: 'minecraft.login', reason: 'connection_rejected', status: 403, code: null, responseFormat: 'html',
+        body: '<html>raw-html-secret</html>',
+        message: /Minecraft 接口访问被拒绝，当前无法完成授权，需由管理员处理/
+      },
+      {
         id: 'explicit-app-registration', step: 3, stage: 'minecraft.login', reason: 'app_not_permitted', status: 403, code: null,
         body: { error: 'ForbiddenOperationException', developerMessage: 'Invalid app registration, see https://aka.ms/AppRegInfo raw-app-registration-secret' },
         message: /当前网站应用未获准访问 Minecraft 服务，需由管理员处理/
@@ -192,7 +198,7 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       const id = 'diagnostic-' + scenario.id, token = await user(id), authorization = await start(token), before = calls.length;
       const [hostname, path] = pipeline[scenario.step];
       assert.equal(upstreamOverride, null, 'previous one-shot failures must be consumed');
-      upstreamOverride = { hostname, path, body: scenario.body, status: scenario.status };
+      upstreamOverride = { hostname, path, body: scenario.body, status: scenario.status, responseFormat: scenario.responseFormat };
       const response = await callback(authorization);
       assert.equal(upstreamOverride, null, 'the actual target upstream must have been reached');
       assert.equal(response.status, 303);
@@ -207,7 +213,8 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       if (scenario.code !== null) assert.match(message, new RegExp(`错误码 ${scenario.code}`));
       else assert.doesNotMatch(message, /错误码 /);
       if (scenario.stage !== 'xbox.xsts') assert.doesNotMatch(message, /尚未创建 Xbox 资料|Xbox 完成账户设置/);
-      if (scenario.reason !== 'app_not_permitted') assert.doesNotMatch(message, /网站应用未获准|管理员处理/);
+      if (!['app_not_permitted', 'connection_rejected'].includes(scenario.reason)) assert.doesNotMatch(message, /网站应用未获准|管理员处理/);
+      if (scenario.reason === 'connection_rejected') assert.doesNotMatch(message, /稍后重试|网站应用未获准/);
       assert.deepEqual(calls.slice(before).map(value => { const url = new URL(value); return [url.hostname, url.pathname]; }), pipeline.slice(0, scenario.step + 1), 'the chain must stop immediately at the failing stage');
 
       const audit = await DB.prepare("SELECT action,detail FROM auth_audit WHERE actor=? AND action='minecraft.authorization.failed'").bind(id).all();
@@ -219,13 +226,13 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       assert.deepEqual(Object.keys(diagnostic).sort(), ['reference', 'stage', 'reason', 'httpStatus', 'providerCode', ...(expectedTokenFacts ? ['tokenFacts'] : []), ...(scenario.step > 0 ? ['responseFormat'] : [])].sort());
       assert.equal(diagnostic.reference, reference); assert.equal(diagnostic.stage, scenario.stage); assert.equal(diagnostic.reason, scenario.reason);
       assert.equal(diagnostic.httpStatus, scenario.status); assert.equal(diagnostic.providerCode, scenario.code);
-      assert.equal(diagnostic.responseFormat, scenario.step > 0 ? 'json' : undefined);
+      assert.equal(diagnostic.responseFormat, scenario.step > 0 ? scenario.responseFormat || 'json' : undefined);
       if (expectedTokenFacts) assert.deepEqual(diagnostic.tokenFacts, expectedTokenFacts);
       const publicOutput = JSON.stringify(diagnostic) + message + decodeURIComponent(redirect.href);
       for (const secret of [
         'xbox-msa-token', 'xbox-refresh', 'xbl-token', 'xsts-token', 'minecraft-token', 'secret-fixture',
         'unknown-scope-secret', 'arbitrary-facts-secret', 'raw-description-secret', 'raw-refresh-secret', 'correlation-secret',
-        'raw-xbox-user-secret', 'raw-xsts-secret', 'raw-generic-forbidden-secret', 'raw-app-registration-secret', 'raw-profile-secret', 'profile-token-secret',
+        'raw-xbox-user-secret', 'raw-xsts-secret', 'raw-generic-forbidden-secret', 'raw-html-secret', 'raw-app-registration-secret', 'raw-profile-secret', 'profile-token-secret',
         'ForbiddenOperationException', 'developerMessage', 'Invalid app registration', 'AppRegInfo',
         authorization.row.state, authorization.row.code_verifier, authorization.code
       ]) assert.ok(!publicOutput.includes(secret), 'diagnostic and browser feedback must exclude upstream bodies and credentials');

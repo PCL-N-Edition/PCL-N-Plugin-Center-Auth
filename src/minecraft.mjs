@@ -30,7 +30,9 @@ export async function fetchMinecraftStatus(accessToken) {
       const providerCode = ['xbox.user', 'xbox.xsts'].includes(stage) && Number.isSafeInteger(data?.XErr) && data.XErr >= 0 ? data.XErr : undefined;
       // Inspect only known response fields in memory; never copy their contents into errors.
       const appDenied = stage === 'minecraft.login' && appRegistrationDenied(data);
-      throw new AuthFlowError(stage, appDenied ? 'app_not_permitted' : 'http_error', {
+      // An HTML 403 establishes access rejection, not an account or app-permission cause.
+      const connectionRejected = stage.startsWith('minecraft.') && res.status === 403 && responseFormat === 'html';
+      throw new AuthFlowError(stage, appDenied ? 'app_not_permitted' : connectionRejected ? 'connection_rejected' : 'http_error', {
         httpStatus: res.status, providerCode, responseFormat, message: providerCode !== undefined ? `xbl:${providerCode}` : `http:${res.status}`
       });
     }
