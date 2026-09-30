@@ -9,10 +9,14 @@ import { decryptSecret } from '../src/totp.mjs';
 
 test('Microsoft website identity and Xbox authorization stay separate in the Worker', async t => {
   const root = new URL('../', import.meta.url), fixtures = new Map(), calls = [], key = 'test-only-token-encryption-key';
-  let gate = null;
+  let gate = null, upstreamOverride = null;
   const modules = ['index.mjs', ...(await readdir(new URL('src/', root))).filter(f => f.endsWith('.mjs') && f !== 'index.mjs')];
   const mf = new Miniflare(convertV4MiniflareOptions({ modulesRoot: fileURLToPath(root), modules: modules.map(f => ({ type: 'ESModule', path: fileURLToPath(new URL('src/' + f, root)) })), compatibilityDate: '2026-09-26', compatibilityFlags: ['nodejs_compat'], d1Databases: { DB: 'microsoft-test' }, bindings: { WEB_ORIGIN: 'https://web.test', MICROSOFT_CLIENT_ID: 'app-fixture', MICROSOFT_CLIENT_SECRET: 'secret-fixture', TOKEN_ENC_KEY: key }, outboundService: async request => {
     const url = new URL(request.url); calls.push(url.href);
+    if (upstreamOverride?.hostname === url.hostname && upstreamOverride.path === url.pathname) {
+      const fixture = upstreamOverride; upstreamOverride = null;
+      return Response.json(fixture.body, { status: fixture.status });
+    }
     if (url.hostname === 'login.microsoftonline.com') {
       assert.equal(request.method, 'POST');
       const form = new URLSearchParams(await request.text());
@@ -128,6 +132,97 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
     const response = await callback(standard), url = new URL(response.headers.get('location')); assert.equal(url.pathname, '/account'); assert.ok(url.searchParams.has('oauth_error')); assert.ok(!url.href.includes('private-upstream-error'));
     const gameToken = await user('cancelled'), cancelled = await start(gameToken);
     const url2 = new URL((await callback(cancelled, '&error=access_denied&error_description=secret-fixture')).headers.get('location')); assert.equal(url2.pathname, '/account'); assert.ok(url2.searchParams.has('minecraft_error')); assert.ok(!url2.href.includes('secret-fixture'));
+  });
+  await t.test('game failures expose a traceable stage without leaking upstream secrets or saving partial grants', async t => {
+    const pipeline = [
+      ['login.microsoftonline.com', '/consumers/oauth2/v2.0/token'],
+      ['user.auth.xboxlive.com', '/user/authenticate'],
+      ['xsts.auth.xboxlive.com', '/xsts/authorize'],
+      ['api.minecraftservices.com', '/launcher/login'],
+      ['api.minecraftservices.com', '/entitlements/mcstore'],
+      ['api.minecraftservices.com', '/minecraft/profile']
+    ];
+    const scenarios = [
+      {
+        id: 'missing-refresh', step: 0, stage: 'microsoft.token', reason: 'missing_refresh_token', status: 200, code: null,
+        body: { access_token: 'xbox-msa-token', scope: 'XboxLive.signin XboxLive.offline_access unknown-scope-secret', safeTokenFacts: { refreshTokenPresent: true, accessToken: 'arbitrary-facts-secret' } },
+        message: /Microsoft 未返回持续授权令牌，游戏授权尚未保存/,
+        tokenFacts: { accessTokenPresent: true, refreshTokenPresent: false, xboxSignInGranted: true, xboxOfflineGranted: true, standardOfflineGranted: false }
+      },
+      {
+        id: 'microsoft-denied', step: 0, stage: 'microsoft.token', reason: 'http_error', status: 400, code: 70000,
+        body: { error: 'invalid_grant', error_codes: [70000], error_description: 'raw-description-secret; refresh_token=raw-refresh-secret', correlation_id: 'correlation-secret' },
+        message: /Microsoft 令牌换取未完成/
+      },
+      {
+        id: 'xbox-user-denied', step: 1, stage: 'xbox.user', reason: 'http_error', status: 401, code: 2148916233,
+        body: { XErr: 2148916233, Message: 'raw-xbox-user-secret' },
+        message: /Xbox 账户验证未完成/
+      },
+      {
+        id: 'xsts-profile-missing', step: 2, stage: 'xbox.xsts', reason: 'http_error', status: 401, code: 2148916233,
+        body: { XErr: 2148916233, Message: 'raw-xsts-secret' },
+        message: /所选 Microsoft 账户尚未创建 Xbox 资料，请先在 Xbox 完成账户设置/
+      },
+      {
+        id: 'minecraft-forbidden', step: 3, stage: 'minecraft.login', reason: 'http_error', status: 403, code: null,
+        body: { error: 'Forbidden', errorMessage: 'raw-generic-forbidden-secret' },
+        message: /Minecraft 服务登录未完成/
+      },
+      {
+        id: 'explicit-app-registration', step: 3, stage: 'minecraft.login', reason: 'app_not_permitted', status: 403, code: null,
+        body: { error: 'ForbiddenOperationException', errorMessage: 'Invalid app registration. See https://aka.ms/AppRegInfo raw-app-registration-secret' },
+        message: /当前网站应用未获准访问 Minecraft 服务，需由管理员处理/
+      },
+      {
+        id: 'profile-unavailable', step: 5, stage: 'minecraft.profile', reason: 'http_error', status: 503, code: null,
+        body: { error: 'Service Unavailable', errorMessage: 'raw-profile-secret', access_token: 'profile-token-secret' },
+        message: /Minecraft 档案读取未完成/
+      }
+    ];
+    for (const scenario of scenarios) await t.test(scenario.id, async () => {
+      const id = 'diagnostic-' + scenario.id, token = await user(id), authorization = await start(token), before = calls.length;
+      const [hostname, path] = pipeline[scenario.step];
+      assert.equal(upstreamOverride, null, 'previous one-shot failures must be consumed');
+      upstreamOverride = { hostname, path, body: scenario.body, status: scenario.status };
+      const response = await callback(authorization);
+      assert.equal(upstreamOverride, null, 'the actual target upstream must have been reached');
+      assert.equal(response.status, 303);
+      const redirect = new URL(response.headers.get('location'));
+      assert.equal(redirect.origin, 'https://web.test'); assert.equal(redirect.pathname, '/account'); assert.equal(redirect.searchParams.get('section'), 'linked');
+      assert.equal(redirect.searchParams.has('minecraft_success'), false); assert.equal(redirect.searchParams.has('oauth_error'), false);
+      const message = redirect.searchParams.get('minecraft_error');
+      assert.match(message, scenario.message);
+      const reference = message.match(/诊断号 ([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})/)?.[1];
+      assert.ok(reference, 'every failure must provide its generated UUID diagnostic reference');
+      assert.match(message, new RegExp(`HTTP ${scenario.status}`));
+      if (scenario.code !== null) assert.match(message, new RegExp(`错误码 ${scenario.code}`));
+      else assert.doesNotMatch(message, /错误码 /);
+      if (scenario.stage !== 'xbox.xsts') assert.doesNotMatch(message, /尚未创建 Xbox 资料|Xbox 完成账户设置/);
+      if (scenario.reason !== 'app_not_permitted') assert.doesNotMatch(message, /网站应用未获准|管理员处理/);
+      assert.deepEqual(calls.slice(before).map(value => { const url = new URL(value); return [url.hostname, url.pathname]; }), pipeline.slice(0, scenario.step + 1), 'the chain must stop immediately at the failing stage');
+
+      const audit = await DB.prepare("SELECT action,detail FROM auth_audit WHERE actor=? AND action='minecraft.authorization.failed'").bind(id).all();
+      assert.equal(audit.results.length, 1);
+      const diagnostic = JSON.parse(audit.results[0].detail);
+      const expectedTokenFacts = scenario.tokenFacts ?? (scenario.step > 0 ? {
+        accessTokenPresent: true, refreshTokenPresent: true, xboxSignInGranted: false, xboxOfflineGranted: false, standardOfflineGranted: false
+      } : undefined);
+      assert.deepEqual(Object.keys(diagnostic).sort(), ['reference', 'stage', 'reason', 'httpStatus', 'providerCode', ...(expectedTokenFacts ? ['tokenFacts'] : [])].sort());
+      assert.equal(diagnostic.reference, reference); assert.equal(diagnostic.stage, scenario.stage); assert.equal(diagnostic.reason, scenario.reason);
+      assert.equal(diagnostic.httpStatus, scenario.status); assert.equal(diagnostic.providerCode, scenario.code);
+      if (expectedTokenFacts) assert.deepEqual(diagnostic.tokenFacts, expectedTokenFacts);
+      const publicOutput = JSON.stringify(diagnostic) + message + decodeURIComponent(redirect.href);
+      for (const secret of [
+        'xbox-msa-token', 'xbox-refresh', 'xbl-token', 'xsts-token', 'minecraft-token', 'secret-fixture',
+        'unknown-scope-secret', 'arbitrary-facts-secret', 'raw-description-secret', 'raw-refresh-secret', 'correlation-secret',
+        'raw-xbox-user-secret', 'raw-xsts-secret', 'raw-generic-forbidden-secret', 'raw-app-registration-secret', 'raw-profile-secret', 'profile-token-secret',
+        authorization.row.state, authorization.row.code_verifier, authorization.code
+      ]) assert.ok(!publicOutput.includes(secret), 'diagnostic and browser feedback must exclude upstream bodies and credentials');
+      assert.equal(await DB.prepare('SELECT * FROM microsoft_tokens WHERE user_id=?').bind(id).first(), null, 'a failed flow must not save a refresh grant');
+      assert.equal(await DB.prepare('SELECT * FROM minecraft_profiles WHERE user_id=?').bind(id).first(), null, 'a failed flow must not save a partial profile');
+      assert.equal((await DB.prepare("SELECT subject FROM oauth_identities WHERE user_id=? AND provider='microsoft'").bind(id).first()).subject, 'identity-' + id, 'a game authorization failure must preserve website identity');
+    });
   });
   await t.test('new authorizations revoke earlier choices and simultaneous callbacks consume once', async () => {
     const token = await user('replace'), old = await start(token), current = await start(token), before = calls.length;

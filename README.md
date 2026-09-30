@@ -61,6 +61,8 @@ Web 在 auth 域使用 HttpOnly Cookie 会话，换取仅存内存的 API Bearer
 - 游戏授权后服务端执行 MSA → Xbox User Token → XSTS → Minecraft 令牌 → 权益与档案读取；各阶段只使用对应资源的令牌，不将 Xbox 令牌用于 Graph。不保存短时访问令牌。
 - `GET /auth/v1/account/minecraft` 读取拥有状况、档案及 `xboxAuthorized`；`DELETE /auth/v1/minecraft/authorization` 单独清除游戏令牌、档案和待完成授权，返回 204，保留网站登录身份。移除 Microsoft 身份及注销也会清除游戏授权。
 - 关联或游戏授权失败回到账户页显示安全提示；普通登录失败仍返回登录页，不把上游错误正文、令牌或应用密钥带入 URL。
+- Microsoft、Xbox User / XSTS、Minecraft 登录 / 权益 / 档案分别诊断，每次上游请求独立限时 12 秒。只有 XSTS 明确返回 `2148916233` 才提示创建 Xbox 资料；普通 HTTP 403 不推断账户或应用权限原因。
+- 游戏授权失败返回诊断号，并在 `auth_audit` 的 `minecraft.authorization.failed` 记录同号的阶段、原因、HTTP 状态、已知数字错误码和令牌存在 / 已知 scope 布尔值。排障按诊断号查询，禁止记录或索取令牌、Cookie、上游错误正文；历史通用提示不足以判定失败原因。
 
 接口与资源范围依据 [Microsoft Xbox 网站授权说明](https://learn.microsoft.com/en-us/gaming/gdk/docs/services/fundamentals/s2s-auth-calls/service-authentication/live-website-authentication)。真实第三方授权仍需用户交互，测试使用实际 Worker/D1 与隔离的上游响应，不能替代真实 Microsoft / Minecraft 应用权限验证。
 

@@ -7,6 +7,7 @@ import { generateRecoveryCodes, hashRecoveryCode } from './recovery.mjs';
 import { verifyRegistration, verifyAssertion, webauthnUserId } from './webauthn.mjs';
 import { fetchMinecraftStatus } from './minecraft.mjs';
 import { XBOX_SCOPE, XBOX_AUTHORIZE, XBOX_TOKEN, exchangeMicrosoftToken } from './microsoft.mjs';
+import { AuthFlowError, safeAuthDiagnostic, gameAuthorizationMessage } from './auth-flow-errors.mjs';
 import { loadLevel, loadProgression, selectLevelDisplay, recordActivity, readActivity, validateVerification } from './progression.mjs';
 import { listConnections, createConnectionAuthorization, completeConnectionAuthorization, unlinkConnection } from './connections.mjs';
 class Failure extends Error { constructor(status, detail) { super(detail); this.status = status; } }
@@ -184,10 +185,20 @@ async function liveOAuthSession(env, row) {
 }
 async function completeMinecraftAuthorization(env, row, config, code, secure) {
   const tokens = await exchangeMicrosoftToken(config, { code, redirect_uri: config.callback, grant_type: 'authorization_code', scope: config.scope, code_verifier: row.code_verifier });
-  if (typeof tokens.refresh_token !== 'string' || !tokens.refresh_token || !env.TOKEN_ENC_KEY) throw new Error('游戏持续授权未完成，请重新授权');
-  const status = await fetchMinecraftStatus(tokens.access_token);
-  const now = Date.now(), encrypted = await encryptSecret(tokens.refresh_token, env.TOKEN_ENC_KEY);
-  const [saved] = await env.DB.batch([
+  if (typeof tokens.refresh_token !== 'string' || !tokens.refresh_token) throw new AuthFlowError('microsoft.token', 'missing_refresh_token', { httpStatus: 200, tokenFacts: tokens.safeTokenFacts });
+  if (!env.TOKEN_ENC_KEY) throw new AuthFlowError('grant.store', 'configuration_missing');
+  let status;
+  try { status = await fetchMinecraftStatus(tokens.access_token); }
+  catch (error) {
+    if (error instanceof AuthFlowError) throw new AuthFlowError(error.stage, error.reason, { httpStatus: error.httpStatus, providerCode: error.providerCode, tokenFacts: tokens.safeTokenFacts });
+    throw error;
+  }
+  const now = Date.now();
+  let encrypted;
+  try { encrypted = await encryptSecret(tokens.refresh_token, env.TOKEN_ENC_KEY); }
+  catch { throw new AuthFlowError('grant.store', 'storage_error'); }
+  let saved;
+  try { [saved] = await env.DB.batch([
     env.DB.prepare(`INSERT INTO microsoft_tokens(user_id,refresh_token_enc,obtained_at,grant_version)
       SELECT ?,?,?,1 WHERE EXISTS(SELECT 1 FROM oauth_states os JOIN sessions s ON s.token_hash=os.session_hash AND s.user_id=os.user_id AND s.scope=os.session_scope
         JOIN users u ON u.id=os.user_id WHERE os.state=? AND os.purpose='minecraft' AND os.consumed=1 AND os.expires>? AND s.expires>? AND u.disabled=0
@@ -199,8 +210,8 @@ async function completeMinecraftAuthorization(env, row, config, code, secure) {
       ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned,profile_id=excluded.profile_id,profile_name=excluded.profile_name,error=NULL,checked_at=excluded.checked_at`)
       .bind(row.user_id, status.owned, status.profileId, status.profileName, new Date(now).toISOString()),
     auditOnChange(env, row.user_id, 'minecraft.authorized', `owned:${status.owned}`)
-  ]);
-  if (!saved.meta.changes) throw new Error('授权状态已失效，请重新开始');
+  ]); } catch { throw new AuthFlowError('grant.save', 'storage_error'); }
+  if (!saved.meta.changes) throw new AuthFlowError('grant.save', 'state_changed');
   const target = new URL('/account?section=linked&minecraft_success=1', env.WEB_ORIGIN);
   return new Response(null, { status: 303, headers: { location: target.href, 'cache-control': 'no-store', 'set-cookie': `${oauthStateCookie}=; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=0${secure ? '; Secure' : ''}` } });
 }
@@ -291,8 +302,15 @@ async function oauthCallback(request, env, provider, secure) {
     if (!user.confirmed_at) headers.set('location', new URL('/register?setup=1', env.WEB_ORIGIN).toString());
     return new Response(null, { status: 303, headers });
   } catch (error) {
-    console.error(JSON.stringify({ oauth: provider, purpose: stateRow.purpose, error: error.name }));
-    return oauthError(env, stateRow.purpose === 'minecraft' ? 'Minecraft 授权失败，请重试；确认所选账户已开通 Xbox 资料' : '第三方身份关联或登录失败，请重试', stateRow);
+    const diagnostic = safeAuthDiagnostic(error, crypto.randomUUID());
+    console.error(JSON.stringify({ oauth: provider, purpose: stateRow.purpose, ...diagnostic }));
+    if (stateRow.purpose === 'minecraft') {
+      // A deterministic, secret-free audit survives Cloudflare's sampled console logs.
+      try { await auditEvent(env, stateRow.user_id, 'minecraft.authorization.failed', JSON.stringify(diagnostic)).run(); }
+      catch { console.error(JSON.stringify({ oauth: provider, purpose: 'minecraft', reference: diagnostic.reference, stage: 'grant.save', reason: 'storage_error' })); }
+      return oauthError(env, gameAuthorizationMessage(diagnostic), stateRow);
+    }
+    return oauthError(env, '第三方身份关联或登录失败，请重试', stateRow);
   }
 }
 export async function finalizeAccountDeletion(env, requestId, userId) {
