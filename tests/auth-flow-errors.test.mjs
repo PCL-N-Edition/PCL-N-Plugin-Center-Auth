@@ -119,3 +119,14 @@ test('revoked or changed grant state gets a retry instruction rather than an ups
   noAccountOrAppConclusion(message);
   assert.doesNotMatch(message, /storage-secret/);
 });
+
+test('response format diagnostics accept only fixed categories, never raw Content-Type or body text', () => {
+  for (const responseFormat of ['json', 'html', 'text', 'other']) {
+    assert.equal(diagnosticOf(new AuthFlowError('minecraft.login', 'http_error', { responseFormat })).responseFormat, responseFormat);
+  }
+  for (const responseFormat of ['application/json; token=header-secret', '<html>body-secret</html>', { body: 'object-secret' }]) {
+    const error = new AuthFlowError('minecraft.login', 'http_error', { responseFormat });
+    assert.equal(diagnosticOf(error).responseFormat, undefined);
+    assert.doesNotMatch(JSON.stringify(diagnosticOf(error)) + messageOf(error), /header-secret|body-secret|object-secret/);
+  }
+});

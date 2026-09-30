@@ -2,13 +2,14 @@ const stages = new Set(['microsoft.token', 'xbox.user', 'xbox.xsts', 'minecraft.
 const reasons = new Set(['http_error', 'network_error', 'timeout', 'invalid_response', 'missing_token', 'missing_refresh_token', 'app_not_permitted', 'configuration_missing', 'storage_error', 'state_changed', 'unexpected']);
 
 export class AuthFlowError extends Error {
-  constructor(stage, reason, { httpStatus, providerCode, message, tokenFacts } = {}) {
+  constructor(stage, reason, { httpStatus, providerCode, message, tokenFacts, responseFormat } = {}) {
     super(message || `${stage}:${reason}`);
     this.name = 'AuthFlowError';
     this.stage = stages.has(stage) ? stage : 'unknown';
     this.reason = reasons.has(reason) ? reason : 'unexpected';
     this.httpStatus = Number.isInteger(httpStatus) && httpStatus >= 100 && httpStatus <= 599 ? httpStatus : null;
     this.providerCode = Number.isSafeInteger(providerCode) && providerCode >= 0 ? providerCode : null;
+    this.responseFormat = ['json', 'html', 'text', 'other'].includes(responseFormat) ? responseFormat : undefined;
     // Presence and known granted scopes are safe; token values and unknown scopes are excluded.
     this.tokenFacts = tokenFacts ? {
       accessTokenPresent: tokenFacts.accessTokenPresent === true,
@@ -33,6 +34,7 @@ export function safeAuthDiagnostic(error, reference) {
     reason: known ? error.reason : 'unexpected',
     httpStatus: known ? error.httpStatus : null,
     providerCode: known ? error.providerCode : null,
+    ...(known && error.responseFormat ? { responseFormat: error.responseFormat } : {}),
     ...(known && error.tokenFacts ? { tokenFacts: error.tokenFacts } : {})
   };
 }

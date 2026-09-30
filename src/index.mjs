@@ -190,7 +190,7 @@ async function completeMinecraftAuthorization(env, row, config, code, secure) {
   let status;
   try { status = await fetchMinecraftStatus(tokens.access_token); }
   catch (error) {
-    if (error instanceof AuthFlowError) throw new AuthFlowError(error.stage, error.reason, { httpStatus: error.httpStatus, providerCode: error.providerCode, tokenFacts: tokens.safeTokenFacts });
+    if (error instanceof AuthFlowError) throw new AuthFlowError(error.stage, error.reason, { httpStatus: error.httpStatus, providerCode: error.providerCode, responseFormat: error.responseFormat, tokenFacts: tokens.safeTokenFacts });
     throw error;
   }
   const now = Date.now();

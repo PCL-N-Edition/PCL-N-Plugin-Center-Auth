@@ -10,7 +10,7 @@ const privateUpstreamText = 'private-upstream-token-should-never-escape';
 const endpoints = [
   'https://user.auth.xboxlive.com/user/authenticate',
   'https://xsts.auth.xboxlive.com/xsts/authorize',
-  'https://api.minecraftservices.com/launcher/login',
+  'https://api.minecraftservices.com/authentication/login_with_xbox',
   'https://api.minecraftservices.com/entitlements/mcstore',
   'https://api.minecraftservices.com/minecraft/profile'
 ];
@@ -59,7 +59,7 @@ test('Xbox exchange follows the official contract and isolates each derived toke
     RelyingParty: 'rp://api.minecraftservices.com/', TokenType: 'JWT',
     Properties: { SandboxId: 'RETAIL', UserTokens: ['xbl-user-token'] }
   });
-  assert.deepEqual(JSON.parse(calls[2].init.body), { platform: 'PC_LAUNCHER', xtoken: 'XBL3.0 x=user-hash;xsts-token' });
+  assert.deepEqual(JSON.parse(calls[2].init.body), { identityToken: 'XBL3.0 x=user-hash;xsts-token' });
   assert.equal(new Headers(calls[2].init.headers).get('x-xbl-contract-version'), null);
   for (const { init } of calls.slice(3)) assert.equal(new Headers(init.headers).get('authorization'), 'Bearer minecraft-token');
   assert.ok(calls.every(({ init }) => init.signal instanceof AbortSignal));
@@ -186,6 +186,7 @@ test('Xbox error codes must be integers, never arbitrary provider text', async t
 
 for (const [label, response, status, reason] of [
   ['explicit app registration denial', { errorMessage: 'Invalid app registration, see https://aka.ms/AppRegInfo ' + privateUpstreamText }, 403, 'app_not_permitted'],
+  ['explicit developer message registration denial', { error: 'ForbiddenOperationException', developerMessage: 'Invalid app registration, see https://aka.ms/AppRegInfo ' + privateUpstreamText }, 403, 'app_not_permitted'],
   ['explicit app registration marker with HTTP 200', { error: 'Invalid app registration ' + privateUpstreamText }, 200, 'app_not_permitted'],
   ['a plain forbidden response', { error: 'FORBIDDEN', errorMessage: privateUpstreamText }, 403, 'http_error'],
   ['an unrelated field containing the marker', { description: 'Invalid app registration ' + privateUpstreamText }, 403, 'http_error']
@@ -210,6 +211,24 @@ test('invalid successful Minecraft profile responses are explicit failures', asy
         assert.equal(error.httpStatus, 200); assertSafeFailure(error); return true;
       });
       assert.equal(calls.length, 5);
+    });
+  }
+});
+
+test('Minecraft login failures classify response media without logging headers or bodies', async t => {
+  for (const [contentType, responseFormat] of [['text/html; charset=utf-8', 'html'], ['text/plain', 'text'], ['application/problem+json', 'json'], ['application/private-header-secret', 'other']]) {
+    await t.test(responseFormat, async sub => {
+      const response = new Response(privateUpstreamText, { status: 403, headers: { 'content-type': contentType } });
+      const calls = mockExchange(sub, { 2: response });
+      await assert.rejects(fetchMinecraftStatus('msa-xbox-token'), error => {
+        assert.equal(error.stage, 'minecraft.login'); assert.equal(error.reason, 'http_error');
+        assert.equal(error.responseFormat, responseFormat);
+        assert.equal(safeAuthDiagnostic(error, diagnosticReference).responseFormat, responseFormat);
+        assertSafeFailure(error);
+        assert.doesNotMatch(JSON.stringify(safeAuthDiagnostic(error, diagnosticReference)), /private-header-secret/);
+        return true;
+      });
+      assert.equal(calls.length, 3);
     });
   }
 });

@@ -9,7 +9,7 @@ export async function fetchMinecraftStatus(accessToken) {
     'minecraft.login': 'minecraft:missing_token', 'minecraft.entitlements': 'minecraft:invalid_entitlements',
     'minecraft.profile': 'minecraft:invalid_profile'
   };
-  const appRegistrationDenied = data => ['error', 'errorMessage', 'message', 'Message', 'error_description'].some(field =>
+  const appRegistrationDenied = data => ['error', 'errorMessage', 'developerMessage', 'message', 'Message', 'error_description'].some(field =>
     typeof data?.[field] === 'string' && /\binvalid\s+app\s+registration\b|\baka\.ms\/AppRegInfo\b/i.test(data[field]));
   const requestJson = async (stage, url, init, allowMissingProfile = false) => {
     let res;
@@ -25,11 +25,13 @@ export async function fetchMinecraftStatus(accessToken) {
       }
     }
     if (!res.ok) {
+      const mediaType = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+      const responseFormat = mediaType === 'application/json' || mediaType.endsWith('+json') ? 'json' : mediaType === 'text/html' ? 'html' : mediaType.startsWith('text/') ? 'text' : 'other';
       const providerCode = ['xbox.user', 'xbox.xsts'].includes(stage) && Number.isSafeInteger(data?.XErr) && data.XErr >= 0 ? data.XErr : undefined;
       // Inspect only known response fields in memory; never copy their contents into errors.
       const appDenied = stage === 'minecraft.login' && appRegistrationDenied(data);
       throw new AuthFlowError(stage, appDenied ? 'app_not_permitted' : 'http_error', {
-        httpStatus: res.status, providerCode, message: providerCode !== undefined ? `xbl:${providerCode}` : `http:${res.status}`
+        httpStatus: res.status, providerCode, responseFormat, message: providerCode !== undefined ? `xbl:${providerCode}` : `http:${res.status}`
       });
     }
     if (!data || typeof data !== 'object' || Array.isArray(data)) {
@@ -53,8 +55,8 @@ export async function fetchMinecraftStatus(accessToken) {
   }, xboxHeaders);
   const uhs = xsts?.DisplayClaims?.xui?.[0]?.uhs ?? xbl?.DisplayClaims?.xui?.[0]?.uhs;
   if (!hasToken(uhs) || !hasToken(xsts.Token)) throw new AuthFlowError('xbox.xsts', 'missing_token', { httpStatus: xstsStatus, message: 'xsts:missing_token' });
-  const { data: minecraft, httpStatus: minecraftStatus } = await postJson('minecraft.login', 'https://api.minecraftservices.com/launcher/login', {
-    platform: 'PC_LAUNCHER', xtoken: `XBL3.0 x=${uhs};${xsts.Token}`
+  const { data: minecraft, httpStatus: minecraftStatus } = await postJson('minecraft.login', 'https://api.minecraftservices.com/authentication/login_with_xbox', {
+    identityToken: `XBL3.0 x=${uhs};${xsts.Token}`
   });
   if (!hasToken(minecraft.access_token)) throw new AuthFlowError('minecraft.login', appRegistrationDenied(minecraft) ? 'app_not_permitted' : 'missing_token', { httpStatus: minecraftStatus, message: 'minecraft:missing_token' });
   const mcAuth = { Authorization: `Bearer ${minecraft.access_token}`, Accept: 'application/json' };

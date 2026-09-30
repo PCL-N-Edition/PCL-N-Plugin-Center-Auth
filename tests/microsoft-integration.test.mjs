@@ -13,6 +13,13 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
   const modules = ['index.mjs', ...(await readdir(new URL('src/', root))).filter(f => f.endsWith('.mjs') && f !== 'index.mjs')];
   const mf = new Miniflare(convertV4MiniflareOptions({ modulesRoot: fileURLToPath(root), modules: modules.map(f => ({ type: 'ESModule', path: fileURLToPath(new URL('src/' + f, root)) })), compatibilityDate: '2026-09-26', compatibilityFlags: ['nodejs_compat'], d1Databases: { DB: 'microsoft-test' }, bindings: { WEB_ORIGIN: 'https://web.test', MICROSOFT_CLIENT_ID: 'app-fixture', MICROSOFT_CLIENT_SECRET: 'secret-fixture', TOKEN_ENC_KEY: key }, outboundService: async request => {
     const url = new URL(request.url); calls.push(url.href);
+    const minecraftLogin = url.href === 'https://api.minecraftservices.com/authentication/login_with_xbox';
+    if (minecraftLogin) {
+      assert.equal(request.method, 'POST');
+      assert.equal(request.headers.get('content-type'), 'application/json');
+      assert.equal(request.headers.get('authorization'), null);
+      assert.deepEqual(await request.json(), { identityToken: 'XBL3.0 x=game-user-hash;xsts-token' });
+    }
     if (upstreamOverride?.hostname === url.hostname && upstreamOverride.path === url.pathname) {
       const fixture = upstreamOverride; upstreamOverride = null;
       return Response.json(fixture.body, { status: fixture.status });
@@ -53,9 +60,7 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       });
       return Response.json({ Token: 'xsts-token', DisplayClaims: { xui: [{ uhs: 'game-user-hash' }] } });
     }
-    if (url.href === 'https://api.minecraftservices.com/launcher/login') {
-      assert.equal((await request.json()).xtoken, 'XBL3.0 x=game-user-hash;xsts-token'); return Response.json({ access_token: 'minecraft-token' });
-    }
+    if (minecraftLogin) return Response.json({ access_token: 'minecraft-token' });
     assert.equal(request.headers.get('authorization'), 'Bearer minecraft-token');
     if (url.pathname === '/entitlements/mcstore') return Response.json({ items: [{ name: 'game_minecraft' }] });
     if (url.pathname === '/minecraft/profile') return Response.json({ id: 'a'.repeat(32), name: 'SeparateGameAccount' });
@@ -141,7 +146,7 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       ['login.microsoftonline.com', '/consumers/oauth2/v2.0/token'],
       ['user.auth.xboxlive.com', '/user/authenticate'],
       ['xsts.auth.xboxlive.com', '/xsts/authorize'],
-      ['api.minecraftservices.com', '/launcher/login'],
+      ['api.minecraftservices.com', '/authentication/login_with_xbox'],
       ['api.minecraftservices.com', '/entitlements/mcstore'],
       ['api.minecraftservices.com', '/minecraft/profile']
     ];
@@ -174,7 +179,7 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       },
       {
         id: 'explicit-app-registration', step: 3, stage: 'minecraft.login', reason: 'app_not_permitted', status: 403, code: null,
-        body: { error: 'ForbiddenOperationException', errorMessage: 'Invalid app registration. See https://aka.ms/AppRegInfo raw-app-registration-secret' },
+        body: { error: 'ForbiddenOperationException', developerMessage: 'Invalid app registration, see https://aka.ms/AppRegInfo raw-app-registration-secret' },
         message: /当前网站应用未获准访问 Minecraft 服务，需由管理员处理/
       },
       {
@@ -211,15 +216,17 @@ test('Microsoft website identity and Xbox authorization stay separate in the Wor
       const expectedTokenFacts = scenario.tokenFacts ?? (scenario.step > 0 ? {
         accessTokenPresent: true, refreshTokenPresent: true, xboxSignInGranted: false, xboxOfflineGranted: false, standardOfflineGranted: false
       } : undefined);
-      assert.deepEqual(Object.keys(diagnostic).sort(), ['reference', 'stage', 'reason', 'httpStatus', 'providerCode', ...(expectedTokenFacts ? ['tokenFacts'] : [])].sort());
+      assert.deepEqual(Object.keys(diagnostic).sort(), ['reference', 'stage', 'reason', 'httpStatus', 'providerCode', ...(expectedTokenFacts ? ['tokenFacts'] : []), ...(scenario.step > 0 ? ['responseFormat'] : [])].sort());
       assert.equal(diagnostic.reference, reference); assert.equal(diagnostic.stage, scenario.stage); assert.equal(diagnostic.reason, scenario.reason);
       assert.equal(diagnostic.httpStatus, scenario.status); assert.equal(diagnostic.providerCode, scenario.code);
+      assert.equal(diagnostic.responseFormat, scenario.step > 0 ? 'json' : undefined);
       if (expectedTokenFacts) assert.deepEqual(diagnostic.tokenFacts, expectedTokenFacts);
       const publicOutput = JSON.stringify(diagnostic) + message + decodeURIComponent(redirect.href);
       for (const secret of [
         'xbox-msa-token', 'xbox-refresh', 'xbl-token', 'xsts-token', 'minecraft-token', 'secret-fixture',
         'unknown-scope-secret', 'arbitrary-facts-secret', 'raw-description-secret', 'raw-refresh-secret', 'correlation-secret',
         'raw-xbox-user-secret', 'raw-xsts-secret', 'raw-generic-forbidden-secret', 'raw-app-registration-secret', 'raw-profile-secret', 'profile-token-secret',
+        'ForbiddenOperationException', 'developerMessage', 'Invalid app registration', 'AppRegInfo',
         authorization.row.state, authorization.row.code_verifier, authorization.code
       ]) assert.ok(!publicOutput.includes(secret), 'diagnostic and browser feedback must exclude upstream bodies and credentials');
       assert.equal(await DB.prepare('SELECT * FROM microsoft_tokens WHERE user_id=?').bind(id).first(), null, 'a failed flow must not save a refresh grant');
