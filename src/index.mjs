@@ -1,6 +1,11 @@
 import { randomBytes } from 'node:crypto';
-import { digest } from './password.mjs';
+import { digest, hashPassword, verifyPassword } from './password.mjs';
 import { createMailer } from './mailer.mjs';
+import { validateHandle, validateDisplayName, normalizeHandle, isReservedHandle, HANDLE_COOLDOWN_DAYS } from './handles.mjs';
+import { randomSecret, otpauthUrl, verifyTotp, encryptSecret, decryptSecret } from './totp.mjs';
+import { generateRecoveryCodes, hashRecoveryCode } from './recovery.mjs';
+import { verifyRegistration, verifyAssertion, webauthnUserId } from './webauthn.mjs';
+import { fetchMinecraftStatus } from './minecraft.mjs';
 class Failure extends Error { constructor(status, detail) { super(detail); this.status = status; } }
 const fail = (status, detail) => { throw new Failure(status, detail); };
 const cookieName = scope => scope === 'operations' ? 'nexa_staff' : 'nexa_console';
@@ -24,15 +29,93 @@ const configFor = (provider, env) => {
   return config;
 };
 const b64json = value => JSON.parse(new TextDecoder().decode(Uint8Array.from(atob(value.replaceAll('-', '+').replaceAll('_', '/') + '='.repeat((4 - value.length % 4) % 4)), c => c.charCodeAt(0))));
-const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/account?oauth_error=${encodeURIComponent(detail)}`, 303);
+// Microsoft 绑定专用：用带 XboxLive.signin 的 MSA 令牌走 XBL → XSTS → Minecraft 服务，
+// 查询游戏拥有状况与档案（id/name）。只存结果，不存任何 Xbox/MC 令牌。
+const oauthError = (env, detail) => Response.redirect(`${env.WEB_ORIGIN}/login?oauth_error=${encodeURIComponent(detail)}`, 303);
 const auditEvent = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) VALUES(?,?,?,?)').bind(actor, action, new Date().toISOString(), detail ?? null);
 // 仅在前一条语句（INSERT OR IGNORE）实际写入时记录，用于条款首次接受等幂等事件。
 const auditOnChange = (env, actor, action, detail) => env.DB.prepare('INSERT INTO auth_audit(actor,action,created_at,detail) SELECT ?,?,?,? WHERE changes()=1').bind(actor, action, new Date().toISOString(), detail ?? null);
-async function body(request) {
+// ---------- 账户身份与 MFA 基础设施 ----------
+const RP_ID = env => env.RP_ID || (env.LOCAL_DEV === 'true' ? 'localhost' : 'pcln.top');
+const webauthnOrigins = env => [env.WEB_ORIGIN, 'https://auth.pcln.top', ...(env.LOCAL_DEV === 'true' ? ['http://127.0.0.1:5730', 'http://localhost:5730'] : [])].filter(Boolean);
+const clientIp = request => request.headers.get('cf-connecting-ip') || 'unknown';
+const hasRealPassword = hash => Boolean(hash) && !hash.startsWith('oauth:') && !hash.startsWith('system:');
+// ---------- 等级与经验 ----------
+// Lv0→1:启动一次游戏(launched 标记);Lv2~7:累计经验达到阈值。
+const LEVEL_THRESHOLDS = { 2: 2000, 3: 5000, 4: 10000, 5: 20000, 6: 50000, 7: 100000 };
+const XP_RULES = {
+  'game.first_launch': { xp: 100, once: true, setsLaunched: true },
+  'game.launch': { xp: 10 },
+  'game.play_minutes': { xpPerUnit: 1 },   // amount = 游玩分钟数
+  'install.complete': { xp: 20 },
+  'resource.download': { xp: 5 }
+};
+const XP_DAILY_CAP = 500; // 每用户每 UTC 日通过事件累计的经验上限(game.first_launch 豁免)
+function computeLevel(xp, launched) {
+  if (!launched) return 0;
+  let level = 1;
+  for (let l = 2; l <= 7; l++) { if (xp >= LEVEL_THRESHOLDS[l]) level = l; else break; }
+  return level;
+}
+async function loadLevel(env, userId) {
+  const row = await env.DB.prepare('SELECT xp, launched, first_launch_at FROM user_levels WHERE user_id=?').bind(userId).first();
+  const xp = row?.xp ?? 0, launched = row?.launched ? 1 : 0;
+  const level = computeLevel(xp, launched);
+  const nextLevel = level < 7 ? level + 1 : null;
+  return {
+    level, xp, launched: Boolean(launched), firstLaunchAt: row?.first_launch_at ?? null,
+    next: nextLevel ? { level: nextLevel, threshold: LEVEL_THRESHOLDS[nextLevel], remaining: Math.max(0, LEVEL_THRESHOLDS[nextLevel] - xp) } : null
+  };
+}
+const serviceAuth = (request, env) => {
+  const token = (request.headers.get('authorization') || '').replace(/^Bearer /, '');
+  if (!env.SERVICE_TOKEN || token !== env.SERVICE_TOKEN) fail(401, '服务凭据无效');
+};
+async function rateLimit(env, key, limit, windowMs, message) {
+  const now = Date.now();
+  const row = await env.DB.prepare('INSERT INTO rate_limits(key,count,expires) VALUES(?,1,?) ON CONFLICT(key) DO UPDATE SET count=CASE WHEN expires<=? THEN 1 ELSE count+1 END,expires=CASE WHEN expires<=? THEN excluded.expires ELSE expires END RETURNING count').bind(key, now + windowMs, now, now).first();
+  if (row.count > limit) fail(429, message);
+}
+async function loadFactors(env, userId) {
+  const [totp, passkeys, recovery] = await Promise.all([
+    env.DB.prepare('SELECT count(*) AS n FROM mfa_totp WHERE user_id=? AND confirmed=1').bind(userId).first(),
+    env.DB.prepare('SELECT count(*) AS n FROM mfa_passkeys WHERE user_id=?').bind(userId).first(),
+    env.DB.prepare('SELECT count(*) AS n FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(userId).first()
+  ]);
+  return {
+    totpCount: totp?.n ?? 0,
+    passkeyCount: passkeys?.n ?? 0,
+    recoveryCount: recovery?.n ?? 0,
+    list: [...(passkeys?.n ? ['passkey'] : []), ...(totp?.n ? ['totp'] : []), ...(recovery?.n ? ['recovery'] : [])]
+  };
+}
+async function createLoginChallenge(env, userId, purpose = 'login') {
+  const challenge = randomBytes(32).toString('base64url');
+  await env.DB.prepare('INSERT INTO login_challenges(challenge_hash,user_id,purpose,expires,created_at) VALUES(?,?,?,?,?)').bind(digest(challenge), userId, purpose, Date.now() + 300000, new Date().toISOString()).run();
+  return challenge;
+}
+async function loadChallenge(env, challenge, purpose = 'login') {
+  const row = await env.DB.prepare('SELECT * FROM login_challenges WHERE challenge_hash=? AND purpose=? AND consumed=0 AND expires>?').bind(digest(String(challenge ?? '')), purpose, Date.now()).first();
+  if (!row) fail(401, '登录挑战已失效，请重新开始');
+  return row;
+}
+async function consumeChallenge(env, challenge, purpose = 'login') {
+  const row = await loadChallenge(env, challenge, purpose);
+  const consumed = await env.DB.prepare('UPDATE login_challenges SET consumed=1 WHERE challenge_hash=? AND consumed=0').bind(row.challenge_hash).run();
+  if (!consumed.meta.changes) fail(401, '登录挑战已被使用，请重新开始');
+  return row;
+}
+// 敏感操作（移除 MFA、生成恢复码）：已设置密码时要求复核当前密码。
+async function reauthSensitive(env, user, input) {
+  const row = await env.DB.prepare('SELECT password_hash FROM users WHERE id=?').bind(user.id).first();
+  if (!hasRealPassword(row?.password_hash)) return;
+  if (!input?.password || !(await verifyPassword(String(input.password), row.password_hash))) fail(403, '该操作需要验证当前密码');
+}
+async function body(request, limit = 4096) {
   if (!request.headers.get('content-type')?.startsWith('application/json')) fail(415, '需要 JSON 请求');
   const reader = request.body?.getReader(); if (!reader) fail(400, '缺少请求体');
   let bytes = 0; const parts = [];
-  try { for (;;) { const { value, done } = await reader.read(); if (done) break; bytes += value.length; if (bytes > 4096) { await reader.cancel(); fail(413, '请求过大'); } parts.push(value); } } finally { reader.releaseLock(); }
+  try { for (;;) { const { value, done } = await reader.read(); if (done) break; bytes += value.length; if (bytes > limit) { await reader.cancel(); fail(413, '请求过大'); } parts.push(value); } } finally { reader.releaseLock(); }
   const all = new Uint8Array(bytes); let offset = 0; for (const part of parts) { all.set(part, offset); offset += part.length; }
   try { return JSON.parse(new TextDecoder().decode(all)); } catch { fail(400, '无效 JSON'); }
 }
@@ -44,11 +127,12 @@ async function currentPolicy(env, kind) {
 async function sessionUser(env, request, scope) {
   const value = credential(request, scope);
   if (!value) fail(401, '请先登录');
-  const user = await env.DB.prepare(`SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer,
+  const user = await env.DB.prepare(`SELECT u.id,COALESCE(u.display_name,u.name) AS name,u.email,u.staff,u.developer,u.trusted_developer AS trustedDeveloper,u.user_handle AS handle,(u.confirmed_at IS NULL) AS setupRequired,
     EXISTS(SELECT 1 FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id AND pd.kind='terms' AND pd.current=1 WHERE ta.user_id=u.id) AS termsAccepted
     FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.scope=? AND s.expires>? AND u.disabled=0 AND (?=0 OR u.staff=1)`).bind(digest(value), scope, Date.now(), scope === 'operations' ? 1 : 0).first();
   if (!user) fail(401, '请先登录');
-  return user;
+  const level = await loadLevel(env, user.id);
+  return { ...user, level: level.level, xp: level.xp };
 }
 async function createSession(env, user, scope, now, secure) {
   const value = randomBytes(32).toString('base64url');
@@ -81,7 +165,10 @@ async function oauthStart(request, env, provider) {
   ]);
   const authorize = new URL(config.authorize);
   authorize.searchParams.set('client_id', config.clientId); authorize.searchParams.set('redirect_uri', config.callback); authorize.searchParams.set('response_type', 'code'); authorize.searchParams.set('state', state);
-  authorize.searchParams.set('scope', config.scope); authorize.searchParams.set('nonce', nonce);
+  // Microsoft 仅在“绑定”时额外请求 XboxLive.signin 与 offline_access：查询 Minecraft 拥有状况与档案，
+  // 并加密保存刷新令牌供启动器后续派生令牌；普通登录保持最小 scope（与 7307a22 的收窄一致）。
+  authorize.searchParams.set('scope', provider === 'microsoft' && mode === 'link' ? `${config.scope} XboxLive.signin offline_access` : config.scope);
+  authorize.searchParams.set('nonce', nonce);
   return new Response(null, { status: 302, headers: { location: authorize.toString(), 'set-cookie': `${oauthStateCookie}=${state}; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=600${env.LOCAL_DEV === 'true' ? '' : '; Secure'}`, 'cache-control': 'no-store' } });
 }
 async function oauthCallback(request, env, provider, secure) {
@@ -120,20 +207,41 @@ async function oauthCallback(request, env, provider, secure) {
         ]);
       }
     } else if (identity) {
-      user = await env.DB.prepare('SELECT id,name,disabled FROM users WHERE id=?').bind(identity.user_id).first();
+      user = await env.DB.prepare('SELECT id,name,disabled,confirmed_at FROM users WHERE id=?').bind(identity.user_id).first();
     } else {
       const id = crypto.randomUUID(), name = `${provider}:${subject}`;
       await env.DB.batch([
-        env.DB.prepare("INSERT INTO users(id,name,password_hash,display_name,email) VALUES(?,?,?,?,?)").bind(id, name, `oauth:${randomBytes(32).toString('hex')}`, displayName, email),
+        // 新用户 confirmed_at 留空:必须到 /register?setup=1 完善用户名/用户 ID 后账户才生效。
+        env.DB.prepare("INSERT INTO users(id,name,password_hash,display_name,email,created_at) VALUES(?,?,?,?,?,?)").bind(id, name, `oauth:${randomBytes(32).toString('hex')}`, displayName, email, new Date().toISOString()),
         env.DB.prepare('INSERT INTO oauth_identities(provider,subject,user_id,email,created_at,updated_at) VALUES(?,?,?,?,?,?)').bind(provider, subject, id, email, new Date().toISOString(), new Date().toISOString())
       ]);
-      user = { id, name, disabled: 0 };
+      user = { id, name, disabled: 0, confirmed_at: null };
     }
     if (!user || user.disabled) throw new Error('account disabled');
     await env.DB.prepare('UPDATE oauth_identities SET email=?,updated_at=? WHERE provider=? AND subject=?').bind(email, new Date().toISOString(), provider, subject).run();
     const headers = new Headers({ location: new URL(stateRow.return_to, env.WEB_ORIGIN).toString(), 'cache-control': 'no-store' });
     headers.append('set-cookie', `${oauthStateCookie}=; HttpOnly; SameSite=Lax; Path=/auth/v1/oauth; Max-Age=0${secure ? '; Secure' : ''}`);
-    if (stateRow.user_id) return new Response(null, { status: 303, headers });
+    if (stateRow.user_id) {
+      // 绑定 Microsoft 成功：同步查询 Xbox → Minecraft 拥有状况与档案并落库。
+      // 任何一步失败都不阻塞绑定本身，只记录 error 供界面展示。
+      if (provider === 'microsoft') {
+        let status = null, chainError = null;
+        try { status = await fetchMinecraftStatus(tokenData.access_token); }
+        catch (chainFailure) { chainError = String(chainFailure?.message ?? chainFailure).slice(0, 60); }
+        const statements = [
+          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=excluded.error, checked_at=excluded.checked_at`)
+            .bind(user.id, status?.owned ?? null, status?.profileId ?? null, status?.profileName ?? null, chainError, new Date().toISOString()),
+          auditEvent(env, user.id, 'minecraft.checked', status ? `owned:${status.owned}` : chainError)
+        ];
+        // 刷新令牌仅在配置 TOKEN_ENC_KEY 时以 AES-GCM 加密保存；无密钥则拒绝落盘（绝不存明文）。
+        if (typeof tokenData.refresh_token === 'string' && env.TOKEN_ENC_KEY) {
+          statements.push(env.DB.prepare('INSERT INTO microsoft_tokens(user_id,refresh_token_enc,obtained_at) VALUES(?,?,?) ON CONFLICT(user_id) DO UPDATE SET refresh_token_enc=excluded.refresh_token_enc, obtained_at=excluded.obtained_at').bind(user.id, await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY), new Date().toISOString()));
+        }
+        await env.DB.batch(statements);
+      }
+      return new Response(null, { status: 303, headers });
+    }
     await env.DB.prepare('UPDATE users SET display_name=?,email=? WHERE id=?').bind(displayName, email, user.id).run();
     if (stateRow.terms_policy_id) {
       // 条款接受与隐私告知随登录原子落库；INSERT OR IGNORE 保证已接受用户不会重复记录。
@@ -145,6 +253,8 @@ async function oauthCallback(request, env, provider, secure) {
     }
     const session = await createSession(env, user, 'console', now, secure);
     headers.append('set-cookie', session.cookie);
+    // 未完成注册的用户强制进入完善资料页;已确认用户按 return_to 回跳。
+    if (!user.confirmed_at) headers.set('location', new URL('/register?setup=1', env.WEB_ORIGIN).toString());
     return new Response(null, { status: 303, headers });
   } catch (error) { console.error(JSON.stringify({ oauth: provider, error: error.name })); return oauthError(env, '第三方登录失败，请重试'); }
 }
@@ -154,7 +264,17 @@ export async function finalizeAccountDeletion(env, requestId, userId) {
     env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(userId),
     env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=?').bind(userId),
     env.DB.prepare('DELETE FROM oauth_states WHERE user_id=?').bind(userId),
-    env.DB.prepare('UPDATE users SET name=?, display_name=NULL, email=NULL, disabled=1 WHERE id=? AND disabled=0').bind('deleted:' + userId, userId),
+    env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM login_challenges WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM mfa_passkeys WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM mfa_totp WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM applications WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM user_flags WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM xp_events WHERE user_id=?').bind(userId),
+    env.DB.prepare('DELETE FROM user_levels WHERE user_id=?').bind(userId),
+    env.DB.prepare("UPDATE users SET name=?, display_name=NULL, email=NULL, user_handle=NULL, password_hash='system:deleted', password_set_at=NULL, disabled=1, staff=0, developer=0, trusted_developer=0 WHERE id=? AND disabled=0").bind('deleted:' + userId, userId),
     env.DB.prepare("UPDATE account_deletion_requests SET state='finalized', finalized_at=?, version=version+1 WHERE id=? AND state='pending'").bind(now, requestId),
     env.DB.prepare('INSERT INTO deletion_tombstones(subject_id,deleted_at,deletion_version,reason) VALUES(?,?,1,?) ON CONFLICT(subject_id) DO UPDATE SET deleted_at=excluded.deleted_at, deletion_version=deletion_tombstones.deletion_version+1').bind(userId, now, 'user_requested'),
     auditEvent(env, userId, 'account.delete.completed', requestId)
@@ -166,7 +286,10 @@ export async function runAuthMaintenance(env) {
   await env.DB.batch([
     env.DB.prepare('DELETE FROM sessions WHERE expires<?').bind(now),
     env.DB.prepare('DELETE FROM oauth_states WHERE expires<? OR (consumed=1 AND expires<?)').bind(now, now - 86400000),
-    env.DB.prepare('DELETE FROM rate_limits WHERE expires<?').bind(now)
+    env.DB.prepare('DELETE FROM rate_limits WHERE expires<?').bind(now),
+    env.DB.prepare('DELETE FROM login_challenges WHERE expires<?').bind(now - 86400000),
+    env.DB.prepare('DELETE FROM mfa_totp WHERE confirmed=0 AND created_at<?').bind(new Date(now - 900000).toISOString()),
+    env.DB.prepare('DELETE FROM users WHERE confirmed_at IS NULL AND created_at<?').bind(new Date(now - 86400000).toISOString())
   ]);
   const due = await env.DB.prepare("SELECT id,user_id FROM account_deletion_requests WHERE state='pending' AND execute_after<=? LIMIT 20").bind(now).all();
   for (const row of due.results) await finalizeAccountDeletion(env, row.id, row.user_id);
@@ -177,12 +300,14 @@ export default {
   async fetch(request, env, ctx) {
     const id = crypto.randomUUID(), url = new URL(request.url), path = url.pathname;
     const mailer = createMailer(env);
-    const later = task => { if (ctx?.waitUntil) ctx.waitUntil(task.catch(() => {})); };
+    // 邮件等旁路任务：未配置服务商时 mailer 可能返回非 Promise，统一包裹后再 waitUntil。
+    const later = task => { if (ctx?.waitUntil) ctx.waitUntil(Promise.resolve(task).catch(() => {})); };
     try {
       const secure = env.LOCAL_DEV !== 'true';
       if (!env.WEB_ORIGIN || (secure && !env.WEB_ORIGIN.startsWith('https://'))) fail(503, '身份服务尚未配置');
-      if (request.method === 'OPTIONS' && path.startsWith('/auth/v1/')) return new Response(null, { status: 204, headers: { ...cors(env), 'access-control-allow-methods': 'GET, POST, DELETE, OPTIONS', 'access-control-allow-headers': 'content-type, x-nexa-request, authorization', 'access-control-max-age': '600' } });
-      if (!['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
+      if (request.method === 'OPTIONS' && path.startsWith('/auth/v1/')) return new Response(null, { status: 204, headers: { ...cors(env), 'access-control-allow-methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS', 'access-control-allow-headers': 'content-type, x-nexa-request, authorization', 'access-control-max-age': '600' } });
+      // /internal/* 为服务间通道,以 SERVICE_TOKEN 鉴权,不适用浏览器 Origin 检查。
+      if (!path.startsWith('/internal/') && !['GET', 'HEAD'].includes(request.method) && (request.headers.get('origin') !== env.WEB_ORIGIN || request.headers.get('x-nexa-request') !== '1')) fail(403, '请求来源无效');
       const oauthMatch = path.match(/^\/auth\/v1\/oauth\/(github|microsoft|google)\/(start|callback)$/);
       if (oauthMatch && request.method === 'GET') return await (oauthMatch[2] === 'start' ? oauthStart(request, env, oauthMatch[1]) : oauthCallback(request, env, oauthMatch[1], secure));
       if (path === '/auth/v1/sessions' && request.method === 'POST') fail(404, '接口不存在');
@@ -194,6 +319,501 @@ export default {
         if (limit.count > 60) fail(429, '凭证请求过于频繁');
         const session = await createSession(env, user, scope, now, secure);
         return json(env, { token: session.value, user: { ...user, scope } });
+      }
+      // ---------- 用户名 / 用户 ID / 密码 ----------
+      if (path === '/auth/v1/account/name' && request.method === 'PATCH') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        let name; try { name = validateDisplayName(input?.name); } catch (error) { fail(400, error.message); }
+        await env.DB.batch([
+          env.DB.prepare('UPDATE users SET display_name=? WHERE id=?').bind(name, user.id),
+          auditEvent(env, user.id, 'account.name.changed', null)
+        ]);
+        return json(env, { ok: true, name });
+      }
+      if (path === '/auth/v1/account/handle/availability' && request.method === 'GET') {
+        await sessionUser(env, request, 'console');
+        const handle = normalizeHandle(url.searchParams.get('handle') || '');
+        if (!handle) return json(env, { available: false, reason: 'invalid' });
+        if (isReservedHandle(handle)) return json(env, { available: false, reason: 'reserved' });
+        const taken = await env.DB.prepare('SELECT 1 FROM users WHERE user_handle=?').bind(handle).first();
+        return json(env, { available: !taken, ...(taken ? { reason: 'taken' } : {}) });
+      }
+      if (path === '/auth/v1/account/handle' && request.method === 'PUT') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        let handle; try { handle = validateHandle(input?.handle); } catch (error) { fail(400, error.message); }
+        const row = await env.DB.prepare('SELECT user_handle, handle_changed_at, email FROM users WHERE id=?').bind(user.id).first();
+        const now = Date.now();
+        if (row?.user_handle && row.handle_changed_at && now - row.handle_changed_at < HANDLE_COOLDOWN_DAYS * 86400000) {
+          const days = Math.ceil((HANDLE_COOLDOWN_DAYS * 86400000 - (now - row.handle_changed_at)) / 86400000);
+          fail(429, `用户 ID 每 ${HANDLE_COOLDOWN_DAYS} 天仅可修改一次，请在 ${days} 天后再试`);
+        }
+        try {
+          await env.DB.batch([
+            env.DB.prepare('UPDATE users SET user_handle=?, handle_changed_at=? WHERE id=?').bind(handle, now, user.id),
+            auditEvent(env, user.id, 'account.handle.changed', row?.user_handle ? `${row.user_handle} -> ${handle}` : handle)
+          ]);
+        } catch (error) {
+          if (String(error?.message ?? error).includes('UNIQUE')) fail(409, '该用户 ID 已被占用');
+          throw error;
+        }
+        if (row?.email) later(mailer.securityNotice(row.email, `你的用户 ID 已变更为 ${handle}。若非本人操作，请立即检查账户安全。`));
+        return json(env, { ok: true, handle, nextChangeAt: new Date(now + HANDLE_COOLDOWN_DAYS * 86400000).toISOString() });
+      }
+      if (path === '/auth/v1/account/password' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        const row = await env.DB.prepare('SELECT password_hash, email FROM users WHERE id=?').bind(user.id).first();
+        const changing = hasRealPassword(row?.password_hash);
+        if (changing && !(input?.currentPassword && await verifyPassword(String(input.currentPassword), row.password_hash))) fail(403, '当前密码不正确');
+        let hash; try { hash = await hashPassword(String(input?.password ?? '')); } catch (error) { fail(400, error.message); }
+        await env.DB.batch([
+          env.DB.prepare('UPDATE users SET password_hash=?, password_set_at=? WHERE id=?').bind(hash, Date.now(), user.id),
+          auditEvent(env, user.id, changing ? 'account.password.changed' : 'account.password.set', null)
+        ]);
+        if (row?.email) later(mailer.securityNotice(row.email, changing ? '你的登录密码已被修改。' : '你的账户已设置登录密码。密码登录将强制要求两步验证。'));
+        const factors = await loadFactors(env, user.id);
+        return json(env, { ok: true, mfa: { required: true, factors: factors.list, message: '密码登录强制两步验证；尚未注册任何方式时，请先注册 passkey 或验证器应用。' } }, changing ? 200 : 201);
+      }
+      // ---------- 用户 ID + 密码登录（两段式：密码 → 强制 2FA） ----------
+      if (path === '/auth/v1/login' && request.method === 'POST') {
+        const input = await body(request);
+        const handle = normalizeHandle(input?.handle);
+        await rateLimit(env, 'login-ip:' + digest(clientIp(request)), 30, 900000, '该网络登录尝试过多，请稍后再试');
+        await rateLimit(env, 'login:' + digest(handle || 'invalid'), 10, 900000, '登录尝试过于频繁，请稍后再试');
+        const row = handle ? await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS display_name, password_hash, disabled FROM users WHERE user_handle=?').bind(handle).first() : null;
+        const passwordOk = Boolean(row) && hasRealPassword(row.password_hash) && await verifyPassword(String(input?.password ?? ''), row.password_hash);
+        if (!row) await verifyPassword(String(input?.password ?? 'x')); // 等时化：用户 ID 不存在也执行一次 scrypt
+        if (!row || !passwordOk) {
+          if (row) await auditEvent(env, row.id, 'login.password.failed', null).run();
+          fail(401, '用户 ID 或密码不正确');
+        }
+        if (row.disabled) fail(403, '账户已被停用');
+        const factors = await loadFactors(env, row.id);
+        if (!factors.list.length) {
+          await auditEvent(env, row.id, 'login.mfa_missing', null).run();
+          return json(env, { type: 'about:blank', title: 'MFA enrollment required', status: 403, code: 'mfa_enrollment_required', detail: '密码登录必须先注册两步验证（passkey、验证器应用或恢复码）。请先使用第三方登录完成注册。' }, 403, { 'content-type': 'application/problem+json' });
+        }
+        const challenge = await createLoginChallenge(env, row.id);
+        await auditEvent(env, row.id, 'login.challenge', factors.list.join('+')).run();
+        return json(env, { challenge, factors: factors.list, user: { name: row.display_name } });
+      }
+      if (path === '/auth/v1/login/passkey/options' && request.method === 'POST') {
+        const input = await body(request);
+        const row = await loadChallenge(env, input?.challenge, 'login');
+        const credentials = await env.DB.prepare('SELECT credential_id FROM mfa_passkeys WHERE user_id=? ORDER BY created_at').bind(row.user_id).all();
+        if (!credentials.results.length) fail(400, '该账户未注册 passkey');
+        const wa = randomBytes(32).toString('base64url');
+        await env.DB.prepare('UPDATE login_challenges SET wa_challenge=? WHERE challenge_hash=?').bind(wa, row.challenge_hash).run();
+        return json(env, { challenge: wa, rpId: RP_ID(env), timeout: 60000, userVerification: 'preferred', allowCredentials: credentials.results.map(c => ({ type: 'public-key', id: c.credential_id })) });
+      }
+      if (path === '/auth/v1/login/passkey' && request.method === 'POST') {
+        const input = await body(request, 16384);
+        const row = await consumeChallenge(env, input?.challenge, 'login');
+        if (!row.wa_challenge) fail(400, '请先获取 passkey 选项');
+        const credential = await env.DB.prepare('SELECT * FROM mfa_passkeys WHERE credential_id=? AND user_id=?').bind(String(input?.credentialId ?? ''), row.user_id).first();
+        if (!credential) fail(401, 'passkey 与该账户不匹配');
+        const user = await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS name, disabled FROM users WHERE id=?').bind(row.user_id).first();
+        if (!user || user.disabled) fail(403, '账户已被停用');
+        let result;
+        try {
+          result = await verifyAssertion({
+            publicKeyJwk: JSON.parse(credential.public_key), alg: credential.algorithm,
+            clientDataJSON: input.clientDataJSON, authenticatorData: input.authenticatorData, signature: input.signature,
+            expectedChallenge: row.wa_challenge, expectedOrigins: webauthnOrigins(env), rpId: RP_ID(env), storedSignCount: credential.sign_count
+          });
+        } catch (error) { console.error(JSON.stringify({ webauthn: 'assertion', error: error.message })); fail(401, 'passkey 校验失败'); }
+        const now = Date.now();
+        await env.DB.batch([
+          env.DB.prepare('UPDATE mfa_passkeys SET sign_count=?, last_used_at=? WHERE credential_id=?').bind(result.signCount, new Date().toISOString(), credential.credential_id),
+          auditEvent(env, row.user_id, 'login.passkey', credential.name || null)
+        ]);
+        const session = await createSession(env, user, 'console', now, secure);
+        return json(env, { ok: true, user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
+      }
+      if (path === '/auth/v1/login/totp' && request.method === 'POST') {
+        const input = await body(request);
+        const row = await loadChallenge(env, input?.challenge, 'login');
+        await rateLimit(env, 'mfa:' + row.user_id, 10, 300000, '两步验证尝试过多，请稍后重新登录');
+        const user = await env.DB.prepare('SELECT id, COALESCE(display_name,name) AS name, disabled FROM users WHERE id=?').bind(row.user_id).first();
+        if (!user || user.disabled) fail(403, '账户已被停用');
+        const code = String(input?.code ?? '');
+        let method = null, recoveryRemaining;
+        const totpDevices = await env.DB.prepare('SELECT id,secret,last_step FROM mfa_totp WHERE user_id=? AND confirmed=1').bind(row.user_id).all();
+        for (const device of totpDevices.results) {
+          const step = await verifyTotp(await decryptSecret(device.secret, env.MFA_ENC_KEY), code, Date.now(), device.last_step);
+          if (step !== null) {
+            const updated = await env.DB.prepare('UPDATE mfa_totp SET last_step=? WHERE id=? AND confirmed=1 AND (last_step IS NULL OR last_step<?)').bind(step, device.id, step).run();
+            if (updated.meta.changes) { method = 'totp'; break; }
+          }
+        }
+        if (!method && /^[A-Za-z0-9-]{5,}$/.test(code.trim())) {
+          const consumedCode = await env.DB.prepare('UPDATE mfa_recovery_codes SET used_at=? WHERE code_hash=? AND user_id=? AND used_at IS NULL').bind(new Date().toISOString(), hashRecoveryCode(code), row.user_id).run();
+          if (consumedCode.meta.changes) {
+            method = 'recovery';
+            const remaining = await env.DB.prepare('SELECT count(*) AS n FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(row.user_id).first();
+            recoveryRemaining = remaining?.n ?? 0;
+          }
+        }
+        if (!method) { await auditEvent(env, row.user_id, 'login.mfa.failed', null).run(); fail(401, '验证码不正确'); }
+        // 验证通过才消费挑战：输错验证码可原地重试，无需重新输入密码。
+        const consumedRow = await env.DB.prepare('UPDATE login_challenges SET consumed=1 WHERE challenge_hash=? AND consumed=0').bind(row.challenge_hash).run();
+        if (!consumedRow.meta.changes) fail(401, '登录挑战已被使用，请重新开始');
+        await auditEvent(env, row.user_id, 'login.' + method, recoveryRemaining !== undefined ? `remaining:${recoveryRemaining}` : null).run();
+        const session = await createSession(env, user, 'console', Date.now(), secure);
+        return json(env, { ok: true, method, ...(recoveryRemaining !== undefined ? { recovery: { remaining: recoveryRemaining } } : {}), user: { id: user.id, name: user.name } }, 200, { 'set-cookie': session.cookie });
+      }
+      // ---------- 注册完善：第三方身份验证后设置用户名 / 用户 ID /（可选）密码 + TOTP ----------
+      if (path === '/auth/v1/register/complete' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const row = await env.DB.prepare('SELECT id, confirmed_at, email FROM users WHERE id=?').bind(user.id).first();
+        if (!row) fail(404, '账户不存在');
+        if (row.confirmed_at) fail(409, '账户已激活，请在账户页修改相关设置');
+        const input = await body(request);
+        let handle, name;
+        try { handle = validateHandle(input?.handle); name = validateDisplayName(input?.name); } catch (error) { fail(400, error.message); }
+        // 回收他人废弃的未确认同名注册；再检查已确认账户占用。
+        await env.DB.prepare('DELETE FROM users WHERE (user_handle=? OR name=?) AND confirmed_at IS NULL AND created_at<? AND id!=?').bind(handle, handle, new Date(Date.now() - 86400000).toISOString(), user.id).run();
+        const taken = await env.DB.prepare('SELECT 1 FROM users WHERE (user_handle=? OR name=?) AND id!=?').bind(handle, handle, user.id).first();
+        if (taken) fail(409, '该用户 ID 已被占用');
+        const password = typeof input?.password === 'string' && input.password ? input.password : null;
+        let hash = null, totpRow = null, step = null;
+        if (password) {
+          try { hash = await hashPassword(password); } catch (error) { fail(400, error.message); }
+          totpRow = await env.DB.prepare('SELECT id,secret FROM mfa_totp WHERE id=? AND user_id=? AND confirmed=0 AND created_at>?').bind(String(input?.totpId ?? ''), user.id, new Date(Date.now() - 900000).toISOString()).first();
+          if (!totpRow) fail(400, '设置密码需要先完成验证器绑定');
+          step = await verifyTotp(await decryptSecret(totpRow.secret, env.MFA_ENC_KEY), String(input?.totpCode ?? ''));
+          if (step === null) fail(400, '动态码不正确');
+        }
+        const nowIso = new Date().toISOString();
+        await env.DB.batch([
+          env.DB.prepare('UPDATE users SET display_name=?, user_handle=?, confirmed_at=?, password_hash=COALESCE(?,password_hash), password_set_at=CASE WHEN ? IS NULL THEN password_set_at ELSE ? END WHERE id=?').bind(name, handle, nowIso, hash, hash, Date.now(), user.id),
+          ...(totpRow ? [env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=? WHERE id=?').bind(nowIso, step, totpRow.id)] : []),
+          auditEvent(env, user.id, 'register.completed', `handle:${handle};password:${hash ? 'set' : 'skip'}`)
+        ]);
+        if (row.email) later(mailer.securityNotice(row.email, `你的账户已完成注册，用户 ID：${handle}。`));
+        return json(env, { ok: true, handle, name, passwordSet: Boolean(hash) });
+      }
+      // ---------- 2FA 因子管理 ----------
+      // 启动器取 Minecraft 令牌：用加密保存的刷新令牌重新派生 XSTS，实时下发短时令牌并刷新档案。
+      if (path === '/auth/v1/minecraft/token' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        await rateLimit(env, 'mctoken:' + user.id, 10, 3600000, '令牌请求过于频繁，请稍后再试');
+        const row = await env.DB.prepare('SELECT refresh_token_enc FROM microsoft_tokens WHERE user_id=?').bind(user.id).first();
+        if (!row) fail(409, '未存储 Microsoft 刷新令牌：请在账户页重新绑定 Microsoft');
+        const config = configFor('microsoft', env);
+        const tokenRes = await fetch(config.token, {
+          method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded', accept: 'application/json' },
+          body: new URLSearchParams({ client_id: config.clientId, client_secret: config.clientSecret, refresh_token: await decryptSecret(row.refresh_token_enc, env.TOKEN_ENC_KEY), grant_type: 'refresh_token', scope: 'XboxLive.signin offline_access' })
+        });
+        const tokenData = await tokenRes.json().catch(() => ({}));
+        if (!tokenRes.ok || !tokenData.access_token) {
+          await auditEvent(env, user.id, 'minecraft.token.failed', `http:${tokenRes.status}`).run();
+          fail(502, 'Microsoft 令牌刷新失败，请重新绑定账户');
+        }
+        if (typeof tokenData.refresh_token === 'string' && env.TOKEN_ENC_KEY) {
+          await env.DB.prepare('UPDATE microsoft_tokens SET refresh_token_enc=?, obtained_at=? WHERE user_id=?').bind(await encryptSecret(tokenData.refresh_token, env.TOKEN_ENC_KEY), new Date().toISOString(), user.id).run();
+        }
+        let status;
+        try { status = await fetchMinecraftStatus(tokenData.access_token); }
+        catch (chainFailure) { fail(502, 'Minecraft 服务暂不可用：' + String(chainFailure?.message ?? chainFailure).slice(0, 40)); }
+        await env.DB.batch([
+          env.DB.prepare(`INSERT INTO minecraft_profiles(user_id,owned,profile_id,profile_name,error,checked_at) VALUES(?,?,?,?,NULL,?)
+            ON CONFLICT(user_id) DO UPDATE SET owned=excluded.owned, profile_id=excluded.profile_id, profile_name=excluded.profile_name, error=NULL, checked_at=excluded.checked_at`)
+            .bind(user.id, status.owned, status.profileId, status.profileName, new Date().toISOString()),
+          auditEvent(env, user.id, 'minecraft.token.issued', `owned:${status.owned}`)
+        ]);
+        if (!status.owned) fail(403, '该 Microsoft 账户未拥有 Minecraft');
+        return json(env, { accessToken: status.accessToken, profileId: status.profileId, profileName: status.profileName, owned: true });
+      }
+      // ---------- 内部服务通道(启动器遥测 → nexa-api → 此处;SERVICE_TOKEN 鉴权) ----------
+      if (path === '/internal/v1/xp' && request.method === 'POST') {
+        serviceAuth(request, env);
+        const input = await body(request, 16384);
+        const user = await env.DB.prepare('SELECT id FROM users WHERE disabled=0 AND (id=? OR user_handle=?)').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
+        if (!user) fail(404, '用户不存在');
+        if (!Array.isArray(input?.events) || !input.events.length || input.events.length > 100) fail(400, 'events 需为 1–100 条');
+        let applied = 0, ignored = 0;
+        // 额度、首启和幂等检查均在 D1 原子批次中执行，避免并发计分超过上限。
+        let current = await loadLevel(env, user.id);
+        for (const event of input.events.slice(0, 100)) {
+          const rule = XP_RULES[String(event?.type ?? '')];
+          if (!rule) { ignored++; continue; }
+          const dedupeKey = typeof event?.dedupeKey === 'string' && event.dedupeKey ? event.dedupeKey.slice(0, 120) : null;
+          if (rule.once) {
+            const done = await env.DB.prepare('SELECT 1 FROM xp_events WHERE user_id=? AND type=?').bind(user.id, event.type).first();
+            if (done) { ignored++; continue; }
+          }
+          const units = rule.xpPerUnit ? Math.floor(Math.max(0, Math.min(600, Number(event?.amount) || 0))) : 1;
+          if (rule.xpPerUnit && units === 0) { ignored++; continue; }
+          const gain = rule.xpPerUnit ? units : rule.xp;
+          const timestamp = event?.occurredAt === undefined ? Date.now() : Date.parse(event.occurredAt);
+          if (!Number.isFinite(timestamp) || timestamp > Date.now() + 300000) fail(400, '事件时间无效');
+          const occurredAt = new Date(timestamp).toISOString();
+          const nowIso = new Date().toISOString();
+          const statements = [
+            env.DB.prepare(`INSERT OR IGNORE INTO xp_events(user_id,type,amount,dedupe_key,occurred_at,created_at)
+              SELECT ?,?,gain,?,?,? FROM (
+                SELECT CASE WHEN ?=1 THEN ? ELSE min(?,max(0,?-(
+                  SELECT COALESCE(sum(amount),0) FROM xp_events WHERE user_id=? AND substr(occurred_at,1,10)=? AND type!='game.first_launch'
+                ))) END AS gain
+              ) WHERE gain>0`).bind(user.id, String(event.type), dedupeKey, occurredAt, nowIso, rule.once ? 1 : 0, gain, gain, XP_DAILY_CAP, user.id, occurredAt.slice(0, 10))
+          ];
+          if (rule.setsLaunched) {
+            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,first_launch_at,updated_at) SELECT user_id,amount,1,occurred_at,created_at FROM xp_events WHERE id=last_insert_rowid() AND changes()=1 ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, launched=1, first_launch_at=COALESCE(user_levels.first_launch_at,excluded.first_launch_at), updated_at=excluded.updated_at'));
+          } else {
+            statements.push(env.DB.prepare('INSERT INTO user_levels(user_id,xp,launched,updated_at) SELECT user_id,amount,0,created_at FROM xp_events WHERE id=last_insert_rowid() AND changes()=1 ON CONFLICT(user_id) DO UPDATE SET xp=user_levels.xp+excluded.xp, updated_at=excluded.updated_at'));
+          }
+          const [inserted] = await env.DB.batch(statements);
+          if (inserted.meta.changes) applied++; else ignored++;
+          current = await loadLevel(env, user.id);
+        }
+        return json(env, { applied, ignored, xp: current.xp, level: current.level });
+      }
+      if (path === '/internal/v1/flags' && request.method === 'POST') {
+        serviceAuth(request, env);
+        const input = await body(request);
+        const user = await env.DB.prepare('SELECT id FROM users WHERE id=? OR user_handle=?').bind(String(input?.user ?? ''), String(input?.user ?? '')).first();
+        if (!user) fail(404, '用户不存在');
+        const flag = String(input?.flag ?? '');
+        if (!/^[a-z_]{3,40}$/.test(flag)) fail(400, '无效的标记名');
+        const value = typeof input?.value === 'string' ? input.value.slice(0, 200) : null;
+        await env.DB.prepare('INSERT INTO user_flags(user_id,flag,value,set_at) VALUES(?,?,?,?) ON CONFLICT(user_id,flag) DO UPDATE SET value=excluded.value, set_at=excluded.set_at').bind(user.id, flag, value, new Date().toISOString()).run();
+        await auditEvent(env, user.id, 'flag.set', `${flag}${value ? ':' + value : ''}`).run();
+        return json(env, { ok: true });
+      }
+      // ---------- 等级 / 资格申请 ----------
+      if (path === '/auth/v1/account/level' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const [level, popular, apps, profile] = await Promise.all([
+          loadLevel(env, user.id),
+          env.DB.prepare("SELECT value, set_at FROM user_flags WHERE user_id=? AND flag='popular_plugin'").bind(user.id).first(),
+          env.DB.prepare('SELECT id,kind,state,note,created_at,reviewed_at FROM applications WHERE user_id=? ORDER BY created_at DESC LIMIT 20').bind(user.id).all(),
+          env.DB.prepare('SELECT staff, developer, trusted_developer FROM users WHERE id=?').bind(user.id).first()
+        ]);
+        const met = {
+          developer: level.level >= 2,
+          trustedDeveloper: level.level >= 3 && Boolean(popular) && Boolean(profile?.developer),
+          admin: level.level >= 4
+        };
+        return json(env, {
+          ...level,
+          roles: { staff: Boolean(profile?.staff), developer: Boolean(profile?.developer), trustedDeveloper: Boolean(profile?.trusted_developer) },
+          popularPlugin: popular ? { evidence: popular.value, setAt: popular.set_at } : null,
+          requirements: {
+            developer: { level: 2, met: met.developer },
+            trustedDeveloper: { level: 3, popularPlugin: Boolean(popular), isDeveloper: Boolean(profile?.developer), met: met.trustedDeveloper },
+            admin: { level: 4, met: met.admin }
+          },
+          applications: apps.results
+        });
+      }
+      if (path === '/auth/v1/applications' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        const kind = String(input?.kind ?? '');
+        if (!['developer', 'trusted_developer', 'admin'].includes(kind)) fail(400, '无效的申请类型');
+        const profile = await env.DB.prepare('SELECT staff, developer, trusted_developer, confirmed_at FROM users WHERE id=?').bind(user.id).first();
+        if (!profile?.confirmed_at) fail(403, '请先完成注册');
+        if (kind === 'developer' && profile.developer) fail(409, '你已经是开发者');
+        if (kind === 'trusted_developer' && profile.trusted_developer) fail(409, '你已经是受信任的开发者');
+        if (kind === 'trusted_developer' && !profile.developer) fail(403, '需要先成为开发者');
+        if (kind === 'admin' && profile.staff) fail(409, '你已经是网站管理员');
+        const level = await loadLevel(env, user.id);
+        if (kind === 'developer' && level.level < 2) fail(403, '开发者申请需要达到 Lv2(先启动一次游戏,再累计 2,000 经验)');
+        if (kind === 'trusted_developer' && level.level < 3) fail(403, '受信任的开发者需要达到 Lv3(累计 5,000 经验)');
+        if (kind === 'admin' && level.level < 4) fail(403, '网站管理员申请需要达到 Lv4(累计 10,000 经验)');
+        if (kind === 'trusted_developer') {
+          const popular = await env.DB.prepare("SELECT 1 FROM user_flags WHERE user_id=? AND flag='popular_plugin'").bind(user.id).first();
+          if (!popular) fail(403, '受信任的开发者需要拥有一个下载量超过 1,000 的插件');
+        }
+        const id = crypto.randomUUID();
+        const nowIso = new Date().toISOString();
+        try {
+          await env.DB.batch([
+            env.DB.prepare("INSERT INTO applications(id,user_id,kind,state,created_at) VALUES(?,?,?,'pending',?)").bind(id, user.id, kind, nowIso),
+            auditEvent(env, user.id, 'application.submitted', kind)
+          ]);
+        } catch (error) {
+          if (String(error?.message ?? error).includes('UNIQUE')) fail(409, '已有同类型的待审申请');
+          throw error;
+        }
+        return json(env, { ok: true, id, kind, state: 'pending' }, 201);
+      }
+      if (path === '/auth/v1/applications/pending' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        if (!user.staff) fail(403, '仅网站管理员可查看待审申请');
+        const rows = await env.DB.prepare(`SELECT a.id,a.kind,a.state,a.created_at,u.id AS user_id,COALESCE(u.display_name,u.name) AS user_name,u.user_handle,
+          COALESCE(ul.xp,0) AS xp, COALESCE(ul.launched,0) AS launched FROM applications a JOIN users u ON u.id=a.user_id
+          LEFT JOIN user_levels ul ON ul.user_id=u.id WHERE a.state='pending' ORDER BY a.created_at LIMIT 100`).all();
+        return json(env, { applications: rows.results.map(r => ({ id: r.id, kind: r.kind, createdAt: r.created_at, user: { id: r.user_id, name: r.user_name, handle: r.user_handle }, level: computeLevel(r.xp, r.launched) })) });
+      }
+      const reviewMatch = path.match(/^\/auth\/v1\/applications\/([0-9a-f-]{36})\/review$/);
+      if (reviewMatch && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        if (!user.staff) fail(403, '仅网站管理员可审批');
+        const input = await body(request);
+        const decision = input?.decision === 'approved' ? 'approved' : input?.decision === 'rejected' ? 'rejected' : null;
+        if (!decision) fail(400, 'decision 需为 approved 或 rejected');
+        const note = typeof input?.note === 'string' ? input.note.slice(0, 400) : null;
+        const app = await env.DB.prepare("SELECT id,user_id,kind,state FROM applications WHERE id=? AND state='pending'").bind(reviewMatch[1]).first();
+        if (!app) fail(404, '申请不存在或已处理');
+        if (app.user_id === user.id) fail(403, '不能审批自己的申请');
+        const nowIso = new Date().toISOString();
+        const statements = [
+          env.DB.prepare("UPDATE applications SET state=?, note=?, reviewed_at=?, reviewer=? WHERE id=? AND state='pending'").bind(decision, note, nowIso, user.id, app.id)
+        ];
+        if (decision === 'approved') {
+          if (app.kind === 'developer') statements.push(env.DB.prepare('UPDATE users SET developer=1 WHERE id=? AND changes()=1').bind(app.user_id));
+          if (app.kind === 'trusted_developer') statements.push(env.DB.prepare('UPDATE users SET trusted_developer=1 WHERE id=? AND changes()=1').bind(app.user_id));
+          if (app.kind === 'admin') statements.push(env.DB.prepare('UPDATE users SET staff=1 WHERE id=? AND changes()=1').bind(app.user_id));
+        }
+        statements.push(auditOnChange(env, user.id, 'application.reviewed', `${app.kind}:${decision}`));
+        const [updated] = await env.DB.batch(statements);
+        if (!updated.meta.changes) fail(409, '申请已被处理，请刷新');
+        return json(env, { ok: true, state: decision });
+      }
+      if (path === '/auth/v1/mfa/factors' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const [passkeys, totpDevices, recovery, passwordRow] = await Promise.all([
+          env.DB.prepare('SELECT credential_id, name, created_at, last_used_at FROM mfa_passkeys WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
+          env.DB.prepare('SELECT id, name, confirmed, created_at, confirmed_at FROM mfa_totp WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
+          env.DB.prepare('SELECT count(*) AS n FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(user.id).first(),
+          env.DB.prepare('SELECT password_set_at FROM users WHERE id=?').bind(user.id).first()
+        ]);
+        return json(env, {
+          passwordSet: Boolean(passwordRow?.password_set_at),
+          passkeys: passkeys.results.map(p => ({ credentialId: p.credential_id, name: p.name, createdAt: p.created_at, lastUsedAt: p.last_used_at })),
+          totp: totpDevices.results.map(t => ({ id: t.id, name: t.name, confirmed: Boolean(t.confirmed), createdAt: t.created_at, confirmedAt: t.confirmed_at })),
+          recovery: { count: recovery?.n ?? 0 }
+        });
+      }
+      if (path === '/auth/v1/mfa/totp/enroll' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        if (!env.MFA_ENC_KEY && secure) fail(503, '两步验证加密密钥尚未配置');
+        const cap = await env.DB.prepare('SELECT count(*) AS n FROM mfa_totp WHERE user_id=?').bind(user.id).first();
+        if ((cap?.n ?? 0) >= 10) fail(400, '最多注册 10 个验证器');
+        const id = crypto.randomUUID();
+        const secret = randomSecret();
+        const account = await env.DB.prepare('SELECT user_handle, COALESCE(display_name,name) AS name FROM users WHERE id=?').bind(user.id).first();
+        await env.DB.prepare('INSERT INTO mfa_totp(id,user_id,secret,confirmed,created_at) VALUES(?,?,?,0,?)').bind(id, user.id, await encryptSecret(secret, env.MFA_ENC_KEY), new Date().toISOString()).run();
+        return json(env, { id, secret, otpauthUrl: otpauthUrl(secret, account?.user_handle || account?.name || 'user'), expiresAt: new Date(Date.now() + 900000).toISOString() }, 201);
+      }
+      if (path === '/auth/v1/mfa/totp/confirm' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request);
+        const row = await env.DB.prepare('SELECT id,secret,created_at FROM mfa_totp WHERE id=? AND user_id=? AND confirmed=0').bind(String(input?.id ?? ''), user.id).first();
+        if (!row) fail(400, '请先发起注册');
+        if (Date.now() - Date.parse(row.created_at) > 900000) fail(400, '注册已超时，请重新发起');
+        const step = await verifyTotp(await decryptSecret(row.secret, env.MFA_ENC_KEY), String(input?.code ?? ''));
+        if (step === null) fail(400, '验证码不正确');
+        const name = typeof input?.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 60) : null;
+        await env.DB.batch([
+          env.DB.prepare('UPDATE mfa_totp SET confirmed=1, confirmed_at=?, last_step=?, name=COALESCE(?,name) WHERE id=? AND user_id=?').bind(new Date().toISOString(), step, name, row.id, user.id),
+          auditEvent(env, user.id, 'mfa.totp.enabled', name)
+        ]);
+        return json(env, { ok: true, id: row.id });
+      }
+      const totpDelete = path.match(/^\/auth\/v1\/mfa\/totp\/([A-Za-z0-9-]+)$/);
+      if (totpDelete && request.method === 'DELETE') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request).catch(() => ({}));
+        await reauthSensitive(env, user, input);
+        const factors = await loadFactors(env, user.id);
+        const passwordRow = await env.DB.prepare('SELECT password_set_at FROM users WHERE id=?').bind(user.id).first();
+        const remaining = factors.passkeyCount + factors.recoveryCount + Math.max(0, factors.totpCount - 1);
+        if (passwordRow?.password_set_at && remaining === 0) fail(400, '密码登录必须保留至少一种两步验证方式，请先注册其他方式');
+        const deleted = await env.DB.prepare('DELETE FROM mfa_totp WHERE id=? AND user_id=?').bind(totpDelete[1], user.id).run();
+        if (!deleted.meta.changes) fail(404, '验证器不存在');
+        await auditEvent(env, user.id, 'mfa.totp.disabled', totpDelete[1]).run();
+        return json(env, { ok: true });
+      }
+      if (path === '/auth/v1/mfa/passkey/register/options' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const account = await env.DB.prepare('SELECT user_handle, COALESCE(display_name,name) AS name FROM users WHERE id=?').bind(user.id).first();
+        const existing = await env.DB.prepare('SELECT credential_id FROM mfa_passkeys WHERE user_id=?').bind(user.id).all();
+        if (existing.results.length >= 10) fail(400, '最多注册 10 个 passkey');
+        const challenge = await createLoginChallenge(env, user.id, 'register');
+        await env.DB.prepare('UPDATE login_challenges SET wa_challenge=? WHERE challenge_hash=?').bind(challenge, digest(challenge)).run();
+        return json(env, {
+          challenge,
+          rp: { id: RP_ID(env), name: 'Nexa Cloud' },
+          user: { id: await webauthnUserId(user.id), name: account?.user_handle || account?.name || 'user', displayName: account?.name || 'user' },
+          pubKeyCredParams: [{ type: 'public-key', alg: -7 }, { type: 'public-key', alg: -257 }],
+          timeout: 120000,
+          authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
+          attestation: 'none',
+          excludeCredentials: existing.results.map(c => ({ type: 'public-key', id: c.credential_id }))
+        });
+      }
+      if (path === '/auth/v1/mfa/passkey/register' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request, 16384);
+        const row = await consumeChallenge(env, input?.challenge, 'register');
+        if (!row.wa_challenge) fail(400, '请先获取注册选项');
+        const attestation = input?.credential?.response ?? {};
+        let result;
+        try {
+          result = await verifyRegistration({
+            clientDataJSON: attestation.clientDataJSON, attestationObject: attestation.attestationObject,
+            expectedChallenge: row.wa_challenge, expectedOrigins: webauthnOrigins(env), rpId: RP_ID(env)
+          });
+        } catch (error) { console.error(JSON.stringify({ webauthn: 'registration', error: error.message })); fail(400, 'passkey 校验失败'); }
+        const name = typeof input?.name === 'string' && input.name.trim() ? input.name.trim().slice(0, 60) : null;
+        try {
+          await env.DB.batch([
+            env.DB.prepare('INSERT INTO mfa_passkeys(credential_id,user_id,public_key,algorithm,sign_count,name,created_at) VALUES(?,?,?,?,?,?,?)').bind(result.credentialId, user.id, JSON.stringify(result.jwk), result.alg, result.signCount, name, new Date().toISOString()),
+            auditEvent(env, user.id, 'mfa.passkey.registered', name)
+          ]);
+        } catch (error) {
+          if (String(error?.message ?? error).includes('UNIQUE')) fail(409, '该 passkey 已注册');
+          throw error;
+        }
+        return json(env, { ok: true, credentialId: result.credentialId, name }, 201);
+      }
+      const passkeyDelete = path.match(/^\/auth\/v1\/mfa\/passkey\/([A-Za-z0-9_-]+)$/);
+      if (passkeyDelete && request.method === 'DELETE') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request).catch(() => ({}));
+        await reauthSensitive(env, user, input);
+        const factors = await loadFactors(env, user.id);
+        const passwordRow = await env.DB.prepare('SELECT password_set_at FROM users WHERE id=?').bind(user.id).first();
+        const stillHas = factors.passkeyCount > 1 || factors.totpCount > 0 || factors.recoveryCount > 0;
+        if (passwordRow?.password_set_at && !stillHas) fail(400, '密码登录必须保留至少一种两步验证方式，请先注册其他方式');
+        const deleted = await env.DB.prepare('DELETE FROM mfa_passkeys WHERE credential_id=? AND user_id=?').bind(passkeyDelete[1], user.id).run();
+        if (!deleted.meta.changes) fail(404, 'passkey 不存在');
+        await auditEvent(env, user.id, 'mfa.passkey.removed', passkeyDelete[1]).run();
+        return json(env, { ok: true });
+      }
+      if (path === '/auth/v1/mfa/recovery/generate' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        if (!env.MFA_ENC_KEY && secure) fail(503, '两步验证加密密钥尚未配置');
+        const input = await body(request).catch(() => ({}));
+        await reauthSensitive(env, user, input);
+        const factors = await loadFactors(env, user.id);
+        if (!factors.totpCount && !factors.passkeyCount) fail(400, '请先注册 passkey 或验证器应用，再生成恢复码');
+        const codes = generateRecoveryCodes(10);
+        const now = new Date().toISOString();
+        await env.DB.batch([
+          env.DB.prepare('DELETE FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL').bind(user.id),
+          ...(await Promise.all(codes.map(async code => env.DB.prepare('INSERT INTO mfa_recovery_codes(code_hash,user_id,code_store,created_at) VALUES(?,?,?,?)').bind(hashRecoveryCode(code), user.id, await encryptSecret(code, env.MFA_ENC_KEY), now)))),
+          auditEvent(env, user.id, 'mfa.recovery.generated', String(codes.length))
+        ]);
+        return json(env, { codes, note: '恢复码为一次性使用，可稍后在账户页复核身份后再次查看。' }, 201);
+      }
+      if (path === '/auth/v1/mfa/recovery/reveal' && request.method === 'POST') {
+        const user = await sessionUser(env, request, 'console');
+        const input = await body(request).catch(() => ({}));
+        await reauthSensitive(env, user, input);
+        const rows = await env.DB.prepare('SELECT code_store, used_at FROM mfa_recovery_codes WHERE user_id=? AND used_at IS NULL ORDER BY rowid').bind(user.id).all();
+        const codes = [];
+        for (const row of rows.results) {
+          if (row.code_store === null || row.code_store === undefined) continue;
+          try { codes.push(await decryptSecret(row.code_store, env.MFA_ENC_KEY)); } catch { /* 密钥变更导致不可解密的旧码跳过 */ }
+        }
+        await auditEvent(env, user.id, 'mfa.recovery.revealed', String(codes.length)).run();
+        return json(env, { codes, missing: rows.results.length - codes.length });
       }
       if (path === '/auth/v1/policies/accept' && request.method === 'POST') {
         const user = await sessionUser(env, request, 'console');
@@ -218,6 +838,22 @@ export default {
         const rows = await env.DB.prepare('SELECT provider,email,created_at FROM oauth_identities WHERE user_id=? ORDER BY created_at').bind(user.id).all();
         return json(env, { identities: rows.results });
       }
+      // Minecraft 拥有状况与档案：启动器与账户页共用（绑定 Microsoft 时写入）。
+      if (path === '/auth/v1/account/minecraft' && request.method === 'GET') {
+        const user = await sessionUser(env, request, 'console');
+        const [identity, profile] = await Promise.all([
+          env.DB.prepare("SELECT 1 AS linked FROM oauth_identities WHERE user_id=? AND provider='microsoft'").bind(user.id).first(),
+          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first()
+        ]);
+        return json(env, {
+          microsoftLinked: Boolean(identity),
+          owned: profile?.owned ?? null,
+          profileId: profile?.profile_id ?? null,
+          profileName: profile?.profile_name ?? null,
+          error: profile?.error ?? null,
+          checkedAt: profile?.checked_at ?? null
+        });
+      }
       const identityMatch = path.match(/^\/auth\/v1\/identities\/(github|microsoft|google)$/);
       if (identityMatch && request.method === 'DELETE') {
         const user = await sessionUser(env, request, 'console');
@@ -225,6 +861,7 @@ export default {
         if ((count?.n ?? 0) <= 1) fail(400, '至少保留一个登录方式');
         await env.DB.batch([
           env.DB.prepare('DELETE FROM oauth_identities WHERE user_id=? AND provider=?').bind(user.id, identityMatch[1]),
+          ...(identityMatch[1] === 'microsoft' ? [env.DB.prepare('DELETE FROM minecraft_profiles WHERE user_id=?').bind(user.id), env.DB.prepare('DELETE FROM microsoft_tokens WHERE user_id=?').bind(user.id)] : []),
           auditEvent(env, user.id, 'oauth.unlinked', identityMatch[1])
         ]);
         return json(env, { ok: true });
@@ -257,17 +894,22 @@ export default {
       }
       if (path === '/auth/v1/account/export' && request.method === 'GET') {
         const user = await sessionUser(env, request, 'console');
-        const [identities, sessions, acceptances, deletion, privacy] = await Promise.all([
+        const [identities, sessions, acceptances, deletion, privacy, mfa, minecraft] = await Promise.all([
           env.DB.prepare('SELECT provider,subject,email,created_at,updated_at FROM oauth_identities WHERE user_id=?').bind(user.id).all(),
           env.DB.prepare("SELECT scope, CASE WHEN expires>? THEN 'active' ELSE 'expired' END AS state FROM sessions WHERE user_id=?").bind(Date.now(), user.id).all(),
           env.DB.prepare('SELECT pd.kind,pd.version,ta.accepted_at AS acceptedAt FROM terms_acceptances ta JOIN policy_documents pd ON pd.id=ta.policy_id WHERE ta.user_id=?').bind(user.id).all(),
           env.DB.prepare('SELECT id,state,requested_at AS requestedAt,execute_after AS executeAfter,cancelled_at AS cancelledAt,finalized_at AS finalizedAt FROM account_deletion_requests WHERE user_id=?').bind(user.id).first(),
-          env.DB.prepare('SELECT id,request_type AS type,state,created_at AS createdAt,updated_at AS updatedAt FROM privacy_requests WHERE user_id=? ORDER BY created_at').bind(user.id).all()
+          env.DB.prepare('SELECT id,request_type AS type,state,created_at AS createdAt,updated_at AS updatedAt FROM privacy_requests WHERE user_id=? ORDER BY created_at').bind(user.id).all(),
+          loadFactors(env, user.id),
+          env.DB.prepare('SELECT owned, profile_id, profile_name, error, checked_at FROM minecraft_profiles WHERE user_id=?').bind(user.id).first()
         ]);
         return json(env, {
-          profile: { id: user.id, name: user.name, email: user.email, staff: user.staff, developer: user.developer },
+          profile: { id: user.id, name: user.name, email: user.email, staff: user.staff, developer: user.developer, handle: user.handle ?? null },
           identities: identities.results, activeSessions: sessions.results, policyAcceptances: acceptances.results,
-          deletionRequest: deletion ?? null, privacyRequests: privacy.results, exportedAt: new Date().toISOString()
+          deletionRequest: deletion ?? null, privacyRequests: privacy.results,
+          mfa: { factors: mfa.list, passkeys: mfa.passkeyCount, totp: mfa.totpCount, recoveryCodes: mfa.recoveryCount },
+          minecraft: minecraft ? { owned: minecraft.owned, profileId: minecraft.profile_id, profileName: minecraft.profile_name, checkedAt: minecraft.checked_at } : null,
+          exportedAt: new Date().toISOString()
         });
       }
       if (path === '/auth/v1/privacy-requests') {
